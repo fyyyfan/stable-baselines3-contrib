@@ -168,35 +168,35 @@ def print_action_decision(env: SatelliteSingleAgentEnv, action: np.ndarray):
               f"卫星: {decision_stats['卫星']}, 云端: {decision_stats['云端']}")
 
 
-def print_observation(env: SatelliteSingleAgentEnv, obs: np.ndarray, verbose: bool = True):
-    """打印观测向量的详细信息"""
-    print(f"\n[观测向量] 形状: {obs.shape}")
+# def print_observation(env: SatelliteSingleAgentEnv, obs: np.ndarray, verbose: bool = True):
+#     """打印观测向量的详细信息"""
+#     print(f"\n[观测向量] 形状: {obs.shape}")
     
-    if verbose:
-        # 解析观测向量结构
-        sat_dim = env.num_satellites * env.obs_sat_dim
-        num_tasks_idx = sat_dim
-        task_start_idx = sat_dim + 1
+#     if verbose:
+#         # 解析观测向量结构
+#         sat_dim = env.num_satellites * env.obs_sat_dim
+#         num_tasks_idx = sat_dim
+#         task_start_idx = sat_dim + 1
         
-        # 卫星负载
-        sat_loads = obs[:sat_dim]
-        print(f"  卫星队列负载: {sat_loads}")
+#         # 卫星负载
+#         sat_loads = obs[:sat_dim]
+#         print(f"  卫星队列负载: {sat_loads}")
         
-        # 任务数量
-        num_tasks = int(obs[num_tasks_idx])
-        print(f"  当前任务数: {num_tasks}")
+#         # 任务数量
+#         num_tasks = int(obs[num_tasks_idx])
+#         print(f"  当前任务数: {num_tasks}")
         
-        # 任务特征（显示前几个）
-        if num_tasks > 0:
-            print(f"  任务特征 (size, cycles, deadline):")
-            for i in range(min(num_tasks, 5)):
-                base = task_start_idx + i * env.obs_task_dim
-                task_size = obs[base]
-                cycles = obs[base + 1]
-                deadline = obs[base + 2]
-                print(f"    任务{i}: [{task_size:.2e}, {cycles:.2f}, {deadline:.4f}]")
-            if num_tasks > 5:
-                print(f"    ... 省略 {num_tasks - 5} 个任务")
+#         # 任务特征（显示前几个）
+#         if num_tasks > 0:
+#             print(f"  任务特征 (size, cycles, deadline):")
+#             for i in range(min(num_tasks, 5)):
+#                 base = task_start_idx + i * env.obs_task_dim
+#                 task_size = obs[base]
+#                 cycles = obs[base + 1]
+#                 deadline = obs[base + 2]
+#                 print(f"    任务{i}: [{task_size:.2e}, {cycles:.2f}, {deadline:.4f}]")
+#             if num_tasks > 5:
+#                 print(f"    ... 省略 {num_tasks - 5} 个任务")
 
 
 def print_step_result(step_num: int, obs: np.ndarray, reward: float, 
@@ -225,7 +225,7 @@ def test_env_creation():
         num_users=10,
         lambda0=0.5,
         I_max=5,
-        max_steps=20
+        max_steps=60
     )
     
     print(f"\n[环境创建成功]")
@@ -247,7 +247,7 @@ def test_env_reset(env: SatelliteSingleAgentEnv):
     print(f"  返回的 info: {info}")
     
     # 打印详细状态
-    print_observation(env, obs)
+    # print_observation(env, obs)
     print_satellite_info(env)
     print_task_info(env)
     
@@ -267,7 +267,7 @@ def test_env_step(env: SatelliteSingleAgentEnv, num_steps: int = 10):
         print_separator(f"Step {step}/{num_steps}", char="-", length=60)
         
         # 1. 打印当前任务状态
-        print_task_info(env)
+        # print_task_info(env)
         
         # 2. 打印卫星状态
         print_satellite_info(env)
@@ -279,7 +279,7 @@ def test_env_step(env: SatelliteSingleAgentEnv, num_steps: int = 10):
         action = sample_masked_action(env, mask_matrix)
         
         # 5. 打印卸载决策
-        print_action_decision(env, action)
+        # print_action_decision(env, action)
         
         # 6. 执行 step
         print(f"\n[执行 step]...")
@@ -294,8 +294,8 @@ def test_env_step(env: SatelliteSingleAgentEnv, num_steps: int = 10):
         total_energy += info.get('total_energy', 0)
         total_overflow += info.get('overflow_count', 0)
         
-        # 9. 打印新的观测
-        print_observation(env, obs, verbose=(step <= 3))  # 仅前3步显示详细观测
+        # # 9. 打印新的观测
+        # print_observation(env, obs, verbose=(step <= 3))  # 仅前3步显示详细观测
         
         if terminated:
             print(f"\n[环境终止] 在 Step {step} 终止")
@@ -480,10 +480,11 @@ def main():
     
     # 测试3: 单步执行（详细打印）
     # env.reset(seed=42)  # 重置环境
-    test_env_step(env, num_steps=5)
+    test_env_step(env, num_steps=60)
+
     
-    # 测试4: 动作空间有效性
-    test_action_space_validity(env)
+    # # 测试4: 动作空间有效性
+    # test_action_space_validity(env)
     
     # # 测试5: 完整 episode
     # test_episode_rollout(env, max_steps=50)

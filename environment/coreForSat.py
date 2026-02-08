@@ -1,3 +1,4 @@
+from typing import IO
 import numpy as np
 from math import atan2, atan, acos, asin, sin, cos, pi, pow, sqrt, erfc, degrees, radians, log2
 from skyfield.api import EarthSatellite, load
@@ -76,6 +77,9 @@ logger = setup_logger()
 '''
     自定义卫星和用户类
 '''
+# 【优化】预加载 timescale 对象，避免每次调用都重新加载
+_TIMESCALE = load.timescale()
+
 @dataclass
 class Time:
     """时间类，用于卫星位置计算"""
@@ -87,9 +91,9 @@ class Time:
     second: float = 0.0
 
     def to_skyfield_time(self):
-        """转换为skyfield时间对象"""
-        return load.timescale().utc(self.year, self.month, self.day, 
-                                  self.hour, self.minute, self.second)
+        """转换为skyfield时间对象【优化】使用全局 timescale 对象"""
+        return _TIMESCALE.utc(self.year, self.month, self.day, 
+                              self.hour, self.minute, self.second)
 
 # # 服务实例类
 # class ServiceInstance(object):
@@ -245,6 +249,9 @@ class SatelliteNode(object):
         self.service_users = []
         # 可见目标卫星列表, SatelliteNode类
         self.target_sat_list = []
+        # 【优化】位置缓存：存储 (time_key, position) 避免重复计算
+        self._pos_cache_key = None
+        self._pos_cache_value = None
         # 【新增】轨道速度，单位：km/s
         # self.velocity = self._compute_orbit_velocity(h)  # km/s
 
@@ -262,6 +269,7 @@ class SatelliteNode(object):
     def _satellite_pos(self, time: Time, pos='xyz'):
         """
         计算某时刻卫星对象的位置
+        【优化】添加位置缓存，同一时刻只计算一次
 
         Args:
             yr, mon, day, hr, mins, sec: 年月日时分秒
@@ -272,6 +280,14 @@ class SatelliteNode(object):
         Return: 
             坐标列表
         """
+        # 生成缓存键（使用时间和输出格式作为键）
+        cache_key = (time.year, time.month, time.day, time.hour, time.minute, time.second, pos)
+        
+        # 检查缓存
+        if self._pos_cache_key == cache_key:
+            return self._pos_cache_value
+        
+        # 缓存未命中，进行计算
         t = time.to_skyfield_time()
         geocentric = self.sat.at(t)
         # 转化为wgs84
@@ -281,13 +297,19 @@ class SatelliteNode(object):
         alt = wgs84_pos.elevation.km
         # 按格式输出
         if pos == 'xyz':
-            return [
+            result = [
                 (alt + wgs84.radius.km) * cos(lat/180*pi) * cos(lon/180*pi),
                 (alt + wgs84.radius.km) * cos(lat/180*pi) * sin(lon/180*pi),
                 (alt + wgs84.radius.km) * sin(lat/180*pi)
             ]
-            # return geocentric.position.km.tolist()
-        return [lon, lat, alt+wgs84.radius.km] 
+        else:
+            result = [lon, lat, alt+wgs84.radius.km]
+        
+        # 更新缓存
+        self._pos_cache_key = cache_key
+        self._pos_cache_value = result
+        
+        return result 
     
     def _get_visible_user(self, users: IoTDevice, time: Time):
         '''
@@ -382,7 +404,6 @@ class SatMECNode(SatelliteNode):
         if self.comp_resource <= 0:
             return float('inf')
         return self.queue_backlog / self.comp_resource
-
 
 
 
@@ -813,7 +834,7 @@ class SatelliteWorld(object):
         # 物理世界的时间，对应年月日
         # self.time = 0  # 删除float类型
         # 时间步长，也就是world_step一步对应的物理世界的时间
-        self.dt = 1.0
+        self.dt = 2.0
         # 新增：当前物理世界的时间对象
         self.current_time = time
         # 创建初始时间的深拷贝，避免引用问题
@@ -918,6 +939,21 @@ class SatelliteWorld(object):
                 best_sat = s
             cloud.current_sat = best_sat
 
+    def _update_device_current_sat(self, device: IoTDevice):
+        """
+         将设备当前卫星设为可见且距离最近的卫星（卸载到云端时用于计算上行等）
+        """
+        best_sat = None
+        best_dist = float("inf")
+        for s in self.satellites:
+            d = self.user_sat_visibility.get((device.id, s.id), -1)
+            if d > 0 and d < best_dist:
+                best_dist = d
+                best_sat = s
+        # if best_sat is None:
+        #     print(f"[错误] 用户{device.id}的当前最近卫星为None")
+        return best_sat
+
     '''
         卸载到本地设备时的延迟和能耗计算
     '''
@@ -944,18 +980,18 @@ class SatelliteWorld(object):
     卸载到卫星边缘计算时的延迟和能耗计算
     '''
     def _transmission_rate(self, device: UserCluster, task: Task, sat: SatMECNode):
-         # 获取链路信息
-        if device.current_sat is None:
-            print(f"[错误] 用户{device.id}的current_sat为None，无法计算通信延迟")
-            return float('inf')
+        # # # 获取链路信息
+        # if device.current_sat is None:
+        #     print(f"[错误] 用户{device.id}的current_sat为None，无法计算通信延迟")
+        #     return float('inf')
         # 获取链路信息
         d_us = self.user_sat_visibility.get((device.id, sat.id))
         if d_us == -1:
             print(f"[ERROR!] 用户{device.id}到卫星{sat.id}的距离为-1")
             return 0
 
-        # 2. 获取参数
-        D_u = task.task_size  # 上传数据量，单位kbit
+        # # 2. 获取参数
+        # D_u = task.task_size  # 上传数据量，单位kbit
         c = 3e8  # 光速 m/s
 
         # 3. 信道参数 - 修正为更合理的值
@@ -1032,7 +1068,7 @@ class SatelliteWorld(object):
         # 计算延迟
         f_comp = sat.comp_resource / len(sat.service_users)
         T_comp = total_cycles / f_comp
-        print(f"设备{device.id}, 卫星{sat.id}, 通信延迟: {T_comm:.2f}s, 排队延迟: {T_queue:.2f}s, 计算延迟: {T_comp:.2f}s")
+        # print(f"设备{device.id}, 卫星{sat.id}, 通信延迟: {T_comm:.2f}s, 排队延迟: {T_queue:.2f}s, 计算延迟: {T_comp:.2f}s")
 
         return T_comm + T_queue + T_comp
 
@@ -1056,7 +1092,7 @@ class SatelliteWorld(object):
         f_comp = sat.comp_resource / len(sat.service_users) * 1e9
         E_comp = sat.kappa_sat * ((f_comp) ** 2) * total_cycles  #cycles
         # print(f"计算资源: {f_comp:.2e}cycles/s, 总CPU周期数: {total_cycles:.2e}cycles, 能耗系数: {sat.kappa_sat:.2e}J/cycles")
-        print(f"设备{device.id}, 卫星{sat.id}, 通信能耗: {E_tx:.2f}J, 计算能耗: {E_comp:.2f}J")
+        # print(f"设备{device.id}, 卫星{sat.id}, 通信能耗: {E_tx:.2f}J, 计算能耗: {E_comp:.2f}J")
         return E_tx + E_comp
 
 
@@ -1081,6 +1117,23 @@ class SatelliteWorld(object):
             return list(range(a, b + 1))
         else:
             return list(range(a, b - 1, -1))
+    
+    def get_backhaul_distance(self, device: IoTDevice, cloud: CloudServer, best_sat: SatMECNode) -> float:
+        """
+        计算设备到云中心的距离
+        """
+        # 将设备当前卫星设为可见且距离最近的卫星（用于计算上行等）
+        sat1 = best_sat
+        
+        path_sat_ids = self.get_ISL_path(sat1, cloud.current_sat)
+        total = 0.0
+        for u, v in zip(path_sat_ids[:-1], path_sat_ids[1:]):
+            link = self.sat_links.get((u, v))
+            if link is None:
+                return float('inf')
+            total += link["distance"]
+        return total
+
 
     def compute_backhaul_delay(self, device: IoTDevice, task: Task,
                                sat_in: SatMECNode, sat_out: SatMECNode,
@@ -1137,7 +1190,7 @@ class SatelliteWorld(object):
         T_down = self._compute_communication_delay(cloud, task, sat_out)
         # 计算延迟
         T_exec = total_cycles / cloud.f_cloud
-        print(f"设备{device.id}, 云端接入延迟: {T_access:.2f}s, ISL回传延迟: {T_backhaul:.2f}s, 下行延迟: {T_down:.2f}s, 计算延迟: {T_exec:.2f}s")
+        # print(f"设备{device.id}, 云端接入延迟: {T_access:.2f}s, ISL回传延迟: {T_backhaul:.2f}s, 下行延迟: {T_down:.2f}s, 计算延迟: {T_exec:.2f}s")
         return T_access + T_backhaul + T_down + T_exec
 
 
@@ -1177,7 +1230,7 @@ class SatelliteWorld(object):
             E_tx = float('inf')
         else:
             E_tx = device.p_tx * Z_bits *1e3 / R_up
-        print(f"设备{device.id}, 云端上行能耗: {E_tx:.2f}J, ISL能耗: {backhaul_energy:.2f}J")
+        # print(f"设备{device.id}, 云端上行能耗: {E_tx:.2f}J, ISL能耗: {backhaul_energy:.2f}J")
         return E_tx + backhaul_energy
 
 

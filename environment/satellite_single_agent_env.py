@@ -53,7 +53,10 @@ class SatelliteSingleAgentEnv(gym.Env):
                  lambda0: float = 0.5,
                  I_max: int | None = None,
                  poisson_quantile: float = 0.95,
-                 max_steps: int = 100):
+                 max_steps: int = 100,
+                 env_update_interval: int = 5, #环境更新间隔，单位为时隙, dt*interval = 卫星网络更新间隔(s)
+                 verbose: bool = True,  # 是否打印详细日志，训练时建议关闭
+                 ):
         super().__init__()
 
         # ===================== 环境规模参数 =====================
@@ -61,6 +64,8 @@ class SatelliteSingleAgentEnv(gym.Env):
         self.num_users = num_users             # N: IoT 设备数
         self.lambda0 = lambda0                 # 单个设备任务到达率
         self.max_steps = max_steps
+        self.env_update_interval = env_update_interval
+        self.verbose = verbose
 
         # ===================== 动作空间设计 =====================
         # 每个任务的卸载选择数: 本地(0) + M颗卫星(1..M) + 云端(M+1)
@@ -80,19 +85,18 @@ class SatelliteSingleAgentEnv(gym.Env):
         # action = [a_0, a_1, ..., a_{I_max-1}], 其中 a_i ∈ {0, 1, ..., B-1}
         self.action_space = spaces.MultiDiscrete([self.B] * self.I_max)
 
-        print(f"[Env Init] M={self.num_satellites}, N={self.num_users}, "
-              f"λ0={self.lambda0}, μ={self.mu}, I_max={self.I_max}, "
-              f"B={self.B}, action_space=MultiDiscrete([{self.B}] * {self.I_max})")
+        if self.verbose:
+            print(f"[Env Init] M={self.num_satellites}, N={self.num_users}, "
+                  f"λ0={self.lambda0}, μ={self.mu}, I_max={self.I_max}, "
+                  f"B={self.B}, action_space=MultiDiscrete([{self.B}] * {self.I_max})")
 
         # ===================== 观测空间设计 =====================
-        # 每个卫星: [queue_backlog]                       → M 维
         # 每个待决策任务: [task_size, cycles, deadline]    → I_max * 3 维
-        # 当前实际任务数                                   → 1 维
-        self.obs_sat_dim = 2
+        # 候选卸载节点的状态：距离、传输速率、计算资源  I_max * B * 3 维
         self.obs_task_dim = 3
-        obs_size = (self.num_satellites * self.obs_sat_dim
-                    + self.I_max * self.obs_task_dim
-                    + 1)
+        self.obs_candi_state_dim = 3
+        obs_size = (self.I_max * self.obs_task_dim + 
+                    self.I_max * self.B * self.obs_candi_state_dim)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(obs_size,),
@@ -100,7 +104,7 @@ class SatelliteSingleAgentEnv(gym.Env):
         )
 
         # ===================== 奖励权重 =====================
-        self.delay_weight = 1.0
+        self.delay_weight = 10.0
         self.energy_weight = 1.0
         self.overflow_penalty = 1.0
 
@@ -158,33 +162,73 @@ class SatelliteSingleAgentEnv(gym.Env):
          ...,
          task_{I_max-1}_size, task_{I_max-1}_cycles, task_{I_max-1}_deadline]
         不足 I_max 的任务位置用 0 填充。
+        
+        【优化】预先缓存设备最近卫星，避免重复查询
         """
         if self.world is None:
             return np.zeros(self.observation_space.shape, dtype=np.float32)
 
         obs_parts = []
 
-        # 1. TODO:卫星节点特征：负载、计算资源、链路距离和速率
-        sat_features = np.zeros((self.num_satellites * 1), dtype=np.float32)
-        for i, sat in enumerate(self.world.satellites[:self.num_satellites]):
-            if isinstance(sat, SatMECNode):
-                sat_features[i*1] = float(sat.queue_backlog)
-                sat_features[i*1+1] = float(sat.comp_resource)
-        obs_parts.append(sat_features)
-
-        # 2. 当前任务数
-        num_tasks = float(len(self.current_task_pool))
-        obs_parts.append(np.array([num_tasks], dtype=np.float32))
-
-        # 3. 每个任务的特征，不足 I_max 补零
+        # 1. 每个任务的特征，不足 I_max 补零
         task_features = np.zeros(self.I_max * self.obs_task_dim, dtype=np.float32)
         for idx, (_, task) in enumerate(self.current_task_pool[:self.I_max]):
             base = idx * self.obs_task_dim
-            task_features[base] = float(task.task_size)
-            task_features[base + 1] = float(task.computing_requirement)
+            task_features[base] = float(task.task_size) / 1e2 #归一化
+            task_features[base + 1] = float(task.total_cpu_cycles()) * 10 #归一化
             task_features[base + 2] = float(task.delay_requirement)
         obs_parts.append(task_features)
 
+        # 【优化】预先计算所有设备的最近卫星，避免在循环中重复计算
+        device_best_sat_cache = {}
+        for device, _ in self.current_task_pool[:self.I_max]:
+            if device.id not in device_best_sat_cache:
+                device_best_sat_cache[device.id] = self.world._update_device_current_sat(device)
+        
+        # 【优化】缓存云端服务器相关信息（只计算一次）
+        cloud_current_sat = self.world.cloud_server.current_sat if self.world.cloud_server else None
+        cloud_f = self.world.cloud_server.f_cloud if self.world.cloud_server else 0.0
+
+        # 2. 候选节点状态，不足I_max补零
+        candi_state_features = np.zeros(self.I_max * self.B * self.obs_candi_state_dim, dtype=np.float32)
+        for idx, (device, task) in enumerate(self.current_task_pool[:self.I_max]):
+            base = idx * self.B * self.obs_candi_state_dim
+            for target in range(self.B):
+                offset = base + target * self.obs_candi_state_dim
+                
+                # 本地执行
+                if target == 0:
+                    candi_state_features[offset] = 0.0
+                    candi_state_features[offset + 1] = 0.0
+                    candi_state_features[offset + 2] = device.f_local
+                
+                # 卸载到卫星节点
+                elif 1 <= target <= self.num_satellites:
+                    sat_idx = target - 1
+                    sat = self.world.satellites[sat_idx]
+                    visibility_dist = self.world.user_sat_visibility.get((device.id, sat_idx), -1)
+                    
+                    if visibility_dist > 0:
+                        candi_state_features[offset] = visibility_dist / 1e3  # 归一化
+                        candi_state_features[offset + 1] = self.world._transmission_rate(device, task, sat) / 1e6  # Mbps
+                    else:
+                        candi_state_features[offset] = 0.0
+                        candi_state_features[offset + 1] = 0.0
+                    candi_state_features[offset + 2] = sat.comp_resource
+                
+                # 卸载到云中心
+                else:
+                    best_sat = device_best_sat_cache.get(device.id)
+                    if best_sat is None or cloud_current_sat is None:
+                        candi_state_features[offset] = 0.0
+                        candi_state_features[offset + 1] = 0.0
+                    else:
+                        candi_state_features[offset] = self.world.get_backhaul_distance(device, self.world.cloud_server, best_sat) / 1e3
+                        candi_state_features[offset + 1] = self.world._transmission_rate(self.world.cloud_server, task, cloud_current_sat) / 1e6
+                    candi_state_features[offset + 2] = cloud_f
+        
+        obs_parts.append(candi_state_features)
+        
         return np.concatenate(obs_parts).astype(np.float32)
 
     # ======================== 动作掩码 ========================
@@ -248,14 +292,17 @@ class SatelliteSingleAgentEnv(gym.Env):
                         if valid and sat.queue_backlog + task_cycles > sat.buffer_capacity:
                             valid = False
                 
-                # target = M+1: 卸载到云端（总是有效，假设云端容量无限）
+                # target = M+1: 卸载到云端
                 elif target == self.num_satellites + 1:
-                    valid = True
+                    # 如果用户没有可见卫星
+                    if self.world._update_device_current_sat(device) is None:
+                        valid = False
+                    else:
+                        valid = True
                 
                 mask_matrix[i, target] = valid
         
         # 对于超出实际任务数的虚拟任务位置，所有目标都标记为有效
-        
         
         # 扁平化返回: (I_max * B,)
         return mask_matrix.flatten()
@@ -294,6 +341,7 @@ class SatelliteSingleAgentEnv(gym.Env):
             sat_tran_gain=np.random.randint(30, 45, self.num_satellites),#[36] * self.num_satellites,
             sat_rec_gain=np.random.randint(36, 51, self.num_satellites),#[41] * self.num_satellites,
             sat_comp_resource=np.random.randint(2, 8, self.num_satellites),#[5]*self.num_satellites,
+            sat_kappa_sat=[1e-28]*self.num_satellites,
             sat_buffer_capacity=[10] * self.num_satellites,#.random.randint(200, 400, self.num_satellites),
         )
         satellites = walker.create_satellites()
@@ -308,7 +356,7 @@ class SatelliteSingleAgentEnv(gym.Env):
         for uid in range(self.num_users):
             
             lon = [100, 102, 105, 110, 115, 120, 123, 128, 130, 131]#int(np.random.uniform(110, 125))
-            lat = [40, 38, 45, 35, 30, 47, 42, 36, 50, 48]#int(np.random.uniform(42,48))
+            lat = [40, 38, 45, 35, 32, 47, 42, 36, 50, 48]#int(np.random.uniform(42,48))
             device = IoTDevice(
                 id=uid,
                 lon=lon[uid],
@@ -323,7 +371,7 @@ class SatelliteSingleAgentEnv(gym.Env):
         # 5. 创建云端服务器
         self.world.cloud_server = CloudServer(
             id=self.num_satellites + 1,
-            lon=135,
+            lon=120,
             lat=45,
             f_cloud=10
         )
@@ -337,7 +385,7 @@ class SatelliteSingleAgentEnv(gym.Env):
         # 7. 生成第一批任务，填充任务池，以便 agent 拿到初始观测
         self._generate_and_collect_tasks()
 
-
+        # ==============记录观测============================
         observation = self._get_obs()
         info = self._get_info()
         return observation, info
@@ -349,9 +397,10 @@ class SatelliteSingleAgentEnv(gym.Env):
         assert self.world is not None, "Call reset() first."
         w = self.world
         
-        print(f"\n{'='*60}")
-        print(f"[Step {self.current_step}] 开始执行")
-        print(f"{'='*60}")
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"[Step {self.current_step}] 开始执行")
+            print(f"{'='*60}")
 
         # ========== 1. 更新世界时间与轨迹 ==========
         w.world_step += 1
@@ -366,17 +415,19 @@ class SatelliteSingleAgentEnv(gym.Env):
             w.current_time.day += int(w.current_time.hour // 24)
             w.current_time.hour = w.current_time.hour % 24
 
-        print(f"[时间更新] {w.current_time.hour}:{w.current_time.minute}:{w.current_time.second:.1f}")
-        print(f"[当前任务池] 任务数量: {len(self.current_task_pool)}")
-        for idx, (dev, task) in enumerate(self.current_task_pool[:min(len(self.current_task_pool), self.I_max)]):
-            print(f"  任务{idx}: 设备{dev.id}, size={task.task_size:.2f}kbits, "
-                  f"cycles={task.computing_requirement:.2f}Gcycles/kbit")
+        if self.verbose:
+            print(f"[时间更新] {w.current_time.hour}:{w.current_time.minute}:{w.current_time.second:.1f}")
+            print(f"[当前任务池] 任务数量: {len(self.current_task_pool)}")
+            for idx, (dev, task) in enumerate(self.current_task_pool[:min(len(self.current_task_pool), self.I_max)]):
+                print(f"  任务{idx}: 设备{dev.id}, size={task.task_size:.2f}kbits, "
+                      f"cycles={task.total_cpu_cycles():.2f}Gcycles")
 
         # ========== 2. 解码动作 ==========
         # action 是 MultiDiscrete 动作，形状为 (I_max,)
         # action[i] ∈ {0..B-1} 对应 current_task_pool[i] 的卸载目标
         decisions = self.decode_action(action)
-        print(f"\n[动作解码] decisions = {decisions[:min(len(self.current_task_pool), self.I_max)]}")
+        if self.verbose:
+            print(f"\n[动作解码] decisions = {decisions[:min(len(self.current_task_pool), self.I_max)]}")
 
         # ========== 3. 对当前任务池中的每个任务执行卸载决策, 更新节点资源状态==
         total_delay = 0.0
@@ -391,7 +442,8 @@ class SatelliteSingleAgentEnv(gym.Env):
             delay_i, energy_i, overflow_i = self._execute_offload(
                 device, task, target, w
             )
-            print(f"【任务{i}】延迟: {delay_i:.2f}s, 能耗: {energy_i:.2f}J, 是否溢出: {overflow_i}")
+            if self.verbose:
+                print(f"【任务{i}】延迟: {delay_i:.2f}s, 能耗: {energy_i:.2f}J, 是否溢出: {overflow_i}")
             # TODO:奖励计算待修改
             total_delay += delay_i
             total_energy += energy_i
@@ -405,26 +457,33 @@ class SatelliteSingleAgentEnv(gym.Env):
                 old_service_users = [u.id for u in sat.service_users]
                 _, processed = sat.process_queue(w.dt)
                 new_service_users = [u.id for u in sat.service_users]
-                if processed > 0 or old_service_users != new_service_users:
-                    print(f"  卫星{sat.id}: 处理了{processed:.4f}cycles, "
-                          f"queue_backlog: {old_backlog:.4f}->{sat.queue_backlog:.4f}, "
-                          f"service_users: {old_service_users}->{new_service_users}")
+                # if processed > 0 or old_service_users != new_service_users:
+                #     print(f"  卫星{sat.id}: 处理了{processed:.4f}cycles, "
+                #           f"queue_backlog: {old_backlog:.4f}->{sat.queue_backlog:.4f}, "
+                #           f"service_users: {old_service_users}->{new_service_users}")
 
         # ========== 4. 计算奖励 ==========
-        reward = -(self.delay_weight * total_delay
+        if num_tasks_decided == 0:
+            reward = 0.0
+        else:
+            reward = -(self.delay_weight * total_delay
                    + self.energy_weight * total_energy
-                   + self.overflow_penalty * overflow_count)
-        print(f"\n[奖励计算] total_delay={total_delay:.2f}s, total_energy={total_energy:.2f}J, "
-              f"overflow_count={overflow_count}, reward={reward:.2f}")
+                   + self.overflow_penalty * overflow_count) / num_tasks_decided
+        if self.verbose:
+            print(f"\n[奖励计算] total_delay={total_delay:.2f}s, total_energy={total_energy:.2f}J, "
+                  f"overflow_count={overflow_count}, reward={reward:.2f}")
 
         # ========== 5. 为下一时隙生成新任务并收集任务池 ==========
         self._generate_and_collect_tasks()
 
-         # 更新 ISL 拓扑和用户-卫星可见性
-        w._update_link_states(w.current_time)
-        w._update_visibility_matrix(w.current_time)
-        # 更新云端服务器当前卫星
-        w._update_cloud_current_sat(self.world.cloud_server)
+        # 一定间隔更新卫星网络拓扑、可见性、云端服务器当前卫星，不会每步更新
+        if self.current_step % self.env_update_interval == 0:
+            # 更新 ISL 拓扑和用户-卫星可见性
+            w._update_link_states(w.current_time)
+            w._update_visibility_matrix(w.current_time)
+            # 更新云端服务器当前卫星
+            w._update_cloud_current_sat(self.world.cloud_server)
+            # print(f"=============[环境更新] 更新卫星网络拓扑、可见性、云端服务器当前卫星=============")
 
 
         # ========== 6. 终止条件 ==========
@@ -464,7 +523,8 @@ class SatelliteSingleAgentEnv(gym.Env):
                 cnt += 1
             if len(self.current_task_pool) >= self.I_max:
                 break
-        print(f"[任务生成] 收集了 {cnt} 个新任务到任务池 (I_max={self.I_max})")
+        if self.verbose:
+            print(f"[任务生成] 收集了 {cnt} 个新任务到任务池 (I_max={self.I_max})")
 
     def _execute_offload(self, device: IoTDevice, task: Task,
                          target: int, w: SatelliteWorld
@@ -508,7 +568,7 @@ class SatelliteSingleAgentEnv(gym.Env):
             device_was_in_service = device in sat.service_users
             if not device_was_in_service:
                 sat.service_users.append(device)
-                print(f"[service_users 更新] 添加设备{device.id}到卫星{sat.id}的service_users")
+                # print(f"[service_users 更新] 添加设备{device.id}到卫星{sat.id}的service_users")
 
             # 2) 先计算延迟与能耗（此时 get_queue_delay() 看到的是本任务入队前的积压，排队时延不含本任务）
             delay = w.compute_edge_delay(device, task, sat)
@@ -518,34 +578,30 @@ class SatelliteSingleAgentEnv(gym.Env):
             arrival_cycles = task.total_cpu_cycles()
             overflow = sat.enqueue_task(device, arrival_cycles)
             
-            if overflow:
+            if overflow and self.verbose:
                 print(f" [入队失败] 设备{device.id}任务入队卫星{sat.id}失败(缓冲区溢出)")
                 # 修复 Bug: 只有当该设备在队列中没有其他任务时，才从 service_users 移除
                 has_other_tasks_in_queue = any(d is device for d, _ in sat.task_queue)
                 if device in sat.service_users and not has_other_tasks_in_queue:
                     sat.service_users.remove(device)
-                    print(f" [service_users 更新] 从卫星{sat.id}的service_users中移除设备{device.id}")
-                elif has_other_tasks_in_queue:
-                    print(f" [service_users 保留] 设备{device.id}在卫星{sat.id}队列中仍有其他任务，保留在service_users中")
+                    # print(f" [service_users 更新] 从卫星{sat.id}的service_users中移除设备{device.id}")
+                # elif has_other_tasks_in_queue:
+                    # print(f" [service_users 保留] 设备{device.id}在卫星{sat.id}队列中仍有其他任务，保留在service_users中")
             else:
-                print(f"[入队成功] 设备{device.id}任务入队卫星{sat.id}成功, 当前queue_backlog={sat.queue_backlog:.4f}")
+                pass
+                # print(f"[入队成功] 设备{device.id}任务入队卫星{sat.id}成功, 当前queue_backlog={sat.queue_backlog:.4f}")
             
         # ---------- 卸载到云端 ----------
         elif target == M + 1:
-            # 将设备当前卫星设为可见且距离最近的卫星（用于计算上行等）
-            best_sat = None
-            best_dist = float("inf")
-            for s in w.satellites[: self.num_satellites]:
-                d = w.user_sat_visibility.get((device.id, s.id), -1)
-                if d > 0 and d < best_dist:
-                    best_dist = d
-                    best_sat = s
-            device.current_sat = best_sat
+            # 给用户设置当前最近卫星
+            device.current_sat = w._update_device_current_sat(device)
             if w.cloud_server is not None:
+                if w.cloud_server.current_sat is None and self.verbose:
+                    print("云端当前卫星为None")
                 delay = w.compute_cloud_total_delay(device, task, w.cloud_server)
                 energy = w.compute_cloud_energy(device, task, w.cloud_server)
-            else:
-                print("云端未创建")
+            # else:
+            #     print("云端未创建")
         
         # 检查延迟是否超过任务截止时间
         if delay > task.delay_requirement:
