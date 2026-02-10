@@ -104,8 +104,9 @@ class SatelliteSingleAgentEnv(gym.Env):
         )
 
         # ===================== 奖励权重 =====================
-        self.delay_weight = 10.0
-        self.energy_weight = 1.0
+        # 第一组10,1.0
+        self.delay_weight = 1.0
+        self.energy_weight = 0.3
         self.overflow_penalty = 1.0
 
         # ===================== 运行时状态 =====================
@@ -364,7 +365,7 @@ class SatelliteSingleAgentEnv(gym.Env):
                 lambda0=self.lambda0,
                 f_local=2,
                 p_tx=0.5,
-                kappa_ue=5e-27
+                kappa_ue=5e-28
             )
             self.world.user_clusters.append(device)
 
