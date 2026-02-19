@@ -1,0 +1,4 @@
+在用户位置随机的环境下
+调整训练参数解决“Early stopping at step 5 due to reaching max kl”
+n_epochs=5,             # 原值： 10
+learning_rate=1e-4,     # 原值： 3e-4

@@ -1,0 +1,14 @@
+设置用户地理位置为随机位置，扩大n_steps和batch_size
+n_steps=512, #256
+batch_size=128, #64
+相较于 MLP，GNN 对于图结构数据的训练通常面临以下挑战：
+样本效率问题：GNN 需要更多的数据来理解拓扑结构，而不仅仅是数值映射。
+训练稳定性：GNN（尤其是 GAT）对超参数更敏感，容易出现梯度震荡。
+计算开销：GNN 的前向传播比 MLP 慢得多，需要优化 Batch 大小和并行采样。
+1.增大batch_size
+梯度噪声: GNN 的梯度通常比 MLP 更嘈杂（Noisy），因为图的拓扑结构引入了额外的方差。
+64 的 Batch Size 对于 PPO + GNN 来说太小了，会导致更新非常不稳定，Loss 曲线剧烈震荡。
+计算效率: GNN 擅长并行处理大 Batch。增大 Batch Size 可以显著提升 GPU 利用率（如果你用了 GPU），减少训练时间。
+2.增大n_steps n_env
+PPO 是 On-policy 算法，数据用完即弃。GNN 需要“看”到更多样的图结构才能学会泛化。
+增加单次更新的数据量（Buffer Size），可以让 Critic (Value Network) 估算得更准，从而稳定 Actor 的更新。

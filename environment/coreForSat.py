@@ -823,7 +823,7 @@ class SatelliteWorld(object):
         # 用户簇列表，元素是IoTDevice对象
         self.user_clusters = []
         # 云数据中心
-        self.cloud = None
+        self.cloud_server = None
 
         # 最大时间步——在创建world时用脚本中的episode_length赋值
         self.world_length = 100
@@ -921,6 +921,12 @@ class SatelliteWorld(object):
                 if dist > 0:
                     sat.visible_user.append(user)
             # print(f"卫星{sat.id}的可见用户列表{sat.visible_user}")
+            
+            # 更新云数据中心cloudServer的可见性
+            d_cs = sat._get_visible_user(self.cloud_server, time)
+            self.user_sat_visibility[(self.cloud_server.id, sat.id)] = d_cs
+            if d_cs > 0:
+                sat.visible_user.append(self.cloud_server)
         # print("用户-卫星可见性信息", self.user_sat_visibility)
         #logger.info(f"用户-卫星可见性信息: {self.user_sat_visibility}")
         #logger.info(f"用户-卫星剩余可见时间: {self.visible_time}")

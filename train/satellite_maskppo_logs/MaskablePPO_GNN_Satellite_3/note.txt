@@ -1,0 +1,3 @@
+固定用户的位置坐标
+n_steps=256
+batch_size=64

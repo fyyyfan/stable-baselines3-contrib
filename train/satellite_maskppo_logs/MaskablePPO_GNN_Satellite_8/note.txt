@@ -1,0 +1,37 @@
+设置卫星数量为8，但没有收敛趋势,因为动作空间(4+2)^6变为(8+2)^6
+num_satellites=8, #4
+num_users=10,
+lambda0=0.3,
+I_max=6,
+max_steps=60,
+env_update_interval=5,
+# ── 并行 ──
+n_envs=4,
+vec_env_cls="subproc",
+# ── GNN ──
+gnn_features_dim=128,
+gnn_hidden_dim=64,
+gnn_num_layers=2,
+gnn_num_heads=4,
+gnn_dropout=0.0,
+# ── 训练 ──
+total_timesteps=600_000,
+n_steps=512, #256
+batch_size=128, #64
+n_epochs=5, 
+learning_rate=3e-4,
+gamma=0.99,
+gae_lambda=0.95,
+clip_range=0.2,
+ent_coef=0.02,
+target_kl=0.03,
+# ── 评估 ──
+eval_freq=6_000,
+n_eval_episodes=5,
+# ── 日志 ──
+log_dir="./satellite_maskppo_logs/",
+save_dir="./satellite_maskppo_models_gnn/8sats",
+seed=42,
+verbose=1,
+# 指定设备: "auto"(有 GPU 则用 GPU), "cuda:0", "cuda:1", "cpu"
+device="cuda:1",

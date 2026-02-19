@@ -203,6 +203,7 @@ def print_step_result(step_num: int, obs: np.ndarray, reward: float,
                      terminated: bool, truncated: bool, info: dict):
     """打印 step 执行结果的详细信息"""
     print(f"\n[Step {step_num} 结果]")
+    print(f"  观测: {obs}")
     print(f"  奖励: {reward:.6f}")
     print(f"  终止: {terminated}, 截断: {truncated}")
     print(f"  详细信息:")

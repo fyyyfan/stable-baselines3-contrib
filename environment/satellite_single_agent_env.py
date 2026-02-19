@@ -354,14 +354,14 @@ class SatelliteSingleAgentEnv(gym.Env):
         # 4. 创建 IoT 设备
         self.world.user_clusters = []
         
+        # lon = [100, 102, 105, 110, 115, 120, 123, 128, 130, 131]#int(np.random.uniform(110, 125))
+        # lat = [40, 38, 45, 35, 32, 47, 42, 36, 50, 48]#int(np.random.uniform(42,48))
+        
         for uid in range(self.num_users):
-            
-            lon = [100, 102, 105, 110, 115, 120, 123, 128, 130, 131]#int(np.random.uniform(110, 125))
-            lat = [40, 38, 45, 35, 32, 47, 42, 36, 50, 48]#int(np.random.uniform(42,48))
             device = IoTDevice(
                 id=uid,
-                lon=lon[uid],
-                lat=lat[uid],
+                lon = int(np.random.uniform(100, 130)), #lon=lon[uid]
+                lat = int(np.random.uniform(30, 50)), #lat=lat[uid]
                 lambda0=self.lambda0,
                 f_local=2,
                 p_tx=0.5,
@@ -371,7 +371,7 @@ class SatelliteSingleAgentEnv(gym.Env):
 
         # 5. 创建云端服务器
         self.world.cloud_server = CloudServer(
-            id=self.num_satellites + 1,
+            id=self.num_users, #编号为用户编号最大值+1
             lon=120,
             lat=45,
             f_cloud=10
