@@ -58,11 +58,159 @@ from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, sync_envs_normalization
 
 
 # =====================================================================
-# 1. 自定义 Callback —— 记录环境指标到 TensorBoard（多环境适配）
+# 1. 自定义 Callback —— 评估环境：记录环境指标到 TensorBoard（多环境适配）
+# =====================================================================
+class SatelliteEvalCallback(MaskableEvalCallback):
+    """
+    扩展 MaskableEvalCallback，在评估时额外记录
+    eval/avg_delay_per_task 和 eval/avg_energy_per_task。
+    通过 evaluate_policy 的 callback 参数在每个评估 step 收集 info 指标，
+    episode 结束时按任务数加权计算每任务平均延迟/能耗。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._eval_ep_delays: list[float] = []
+        self._eval_ep_energies: list[float] = []
+        self._cur_delay: dict[int, float] = {}
+        self._cur_energy: dict[int, float] = {}
+        self._cur_tasks: dict[int, int] = {}
+
+    def _collect_eval_metrics(self, locals_dict, globals_dict):
+        """在 evaluate_policy 每个 step 后被调用，积累指标。"""
+        self._log_success_callback(locals_dict, globals_dict)
+
+        info = locals_dict["info"]
+        done = locals_dict["done"]
+        i = locals_dict["i"]
+
+        self._cur_delay.setdefault(i, 0.0)
+        self._cur_energy.setdefault(i, 0.0)
+        self._cur_tasks.setdefault(i, 0)
+
+        self._cur_delay[i] += info.get("total_delay", 0.0)
+        self._cur_energy[i] += info.get("total_energy", 0.0)
+        self._cur_tasks[i] += info.get("num_tasks", 0)
+
+        if done:
+            total_tasks = self._cur_tasks[i]
+            if total_tasks > 0:
+                self._eval_ep_delays.append(self._cur_delay[i] / total_tasks)
+                self._eval_ep_energies.append(self._cur_energy[i] / total_tasks)
+            self._cur_delay[i] = 0.0
+            self._cur_energy[i] = 0.0
+            self._cur_tasks[i] = 0
+
+    def _on_step(self) -> bool:
+        continue_training = True
+
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            if self.model.get_vec_normalize_env() is not None:
+                try:
+                    sync_envs_normalization(self.training_env, self.eval_env)
+                except AttributeError as e:
+                    raise AssertionError(
+                        "Training and eval env are not wrapped the same way"
+                    ) from e
+
+            self._is_success_buffer = []
+            self._eval_ep_delays = []
+            self._eval_ep_energies = []
+            self._cur_delay = {}
+            self._cur_energy = {}
+            self._cur_tasks = {}
+
+            episode_rewards, episode_lengths = evaluate_policy(
+                self.model,
+                self.eval_env,
+                n_eval_episodes=self.n_eval_episodes,
+                render=self.render,
+                deterministic=self.deterministic,
+                return_episode_rewards=True,
+                warn=self.warn,
+                callback=self._collect_eval_metrics,
+                use_masking=self.use_masking,
+            )
+
+            if self.log_path is not None:
+                assert isinstance(episode_rewards, list)
+                assert isinstance(episode_lengths, list)
+                self.evaluations_timesteps.append(self.num_timesteps)
+                self.evaluations_results.append(episode_rewards)
+                self.evaluations_length.append(episode_lengths)
+
+                kwargs = {}
+                if len(self._is_success_buffer) > 0:
+                    self.evaluations_successes.append(self._is_success_buffer)
+                    kwargs = dict(successes=self.evaluations_successes)
+
+                np.savez(
+                    self.log_path,
+                    timesteps=self.evaluations_timesteps,
+                    results=self.evaluations_results,
+                    ep_lengths=self.evaluations_length,
+                    **kwargs,
+                )
+
+            mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
+            mean_ep_length, std_ep_length = np.mean(episode_lengths), np.std(episode_lengths)
+            self.last_mean_reward = float(mean_reward)
+
+            if self.verbose > 0:
+                print(
+                    f"Eval num_timesteps={self.num_timesteps}, "
+                    f"episode_reward={mean_reward:.2f} +/- {std_reward:.2f}"
+                )
+                print(f"Episode length: {mean_ep_length:.2f} +/- {std_ep_length:.2f}")
+
+            self.logger.record("eval/mean_reward", float(mean_reward))
+            self.logger.record("eval/mean_ep_length", mean_ep_length)
+
+            if len(self._eval_ep_delays) > 0:
+                mean_delay = float(np.mean(self._eval_ep_delays))
+                mean_energy = float(np.mean(self._eval_ep_energies))
+                self.logger.record("eval/avg_delay_per_task", mean_delay)
+                self.logger.record("eval/avg_energy_per_task", mean_energy)
+                if self.verbose > 0:
+                    print(
+                        f"Eval avg_delay_per_task={mean_delay:.4f}, "
+                        f"avg_energy_per_task={mean_energy:.4f}"
+                    )
+
+            if len(self._is_success_buffer) > 0:
+                success_rate = np.mean(self._is_success_buffer)
+                if self.verbose > 0:
+                    print(f"Success rate: {100 * success_rate:.2f}%")
+                self.logger.record("eval/success_rate", success_rate)
+
+            self.logger.record(
+                "time/total_timesteps", self.num_timesteps, exclude="tensorboard"
+            )
+            self.logger.dump(self.num_timesteps)
+
+            if mean_reward > self.best_mean_reward:
+                if self.verbose > 0:
+                    print("New best mean reward!")
+                if self.best_model_save_path is not None:
+                    self.model.save(
+                        os.path.join(self.best_model_save_path, "best_model")
+                    )
+                self.best_mean_reward = float(mean_reward)
+                if self.callback_on_new_best is not None:
+                    continue_training = self.callback_on_new_best.on_step()
+
+            if self.callback is not None:
+                continue_training = continue_training and self._on_event()
+
+        return continue_training
+
+
+# =====================================================================
+# 1-b. 自定义 Callback —— 记录环境指标到 TensorBoard（多环境适配）
 # =====================================================================
 class SatelliteMetricsCallback(BaseCallback):
     """
@@ -193,7 +341,7 @@ def train(
     lambda0: float = 0.5,
     I_max: int | None = 8,
     max_steps: int = 60,
-    env_update_interval: int = 5,
+    env_update_interval: int = 5, #更新网络拓扑的周期
     # ── 并行参数 ──
     n_envs: int = 4,
     vec_env_cls: str = "subproc",  # "subproc" 或 "dummy"
@@ -339,7 +487,7 @@ def train(
 
     adjusted_eval_freq = max(eval_freq // n_envs, 1)
 
-    eval_callback = MaskableEvalCallback(
+    eval_callback = SatelliteEvalCallback(
         eval_env,
         best_model_save_path=save_dir,
         log_path=os.path.join(log_dir, "eval_results_gnn"),
@@ -432,38 +580,38 @@ def demo_inference(model_path: str, num_episodes: int = 3, **env_kwargs):
 if __name__ == "__main__":
     trained_model = train(
         # ── 环境 ──
-        num_satellites=8, #4
+        num_satellites=4, #4;8
         num_users=10,
         lambda0=0.3,
         I_max=6,
         max_steps=60,
         env_update_interval=5,
         # ── 并行 ──
-        n_envs=6, #4
+        n_envs=4, #4;6
         vec_env_cls="subproc",
         # ── GNN ──
-        gnn_features_dim=256, #128
-        gnn_hidden_dim=128, #64
+        gnn_features_dim=128, #128;256
+        gnn_hidden_dim=64, #64;128
         gnn_num_layers=2,
         gnn_num_heads=4,
         gnn_dropout=0.0,
         # ── 训练 ──
-        total_timesteps=1000_000,
-        n_steps=1024, #256
-        batch_size=256, #64
-        n_epochs=10, 
-        learning_rate=1e-4, #3e-4,
+        total_timesteps=800_000,
+        n_steps=512, #256;1024
+        batch_size=128, #64;256
+        n_epochs=5, #5;10
+        learning_rate=3e-4, #3e-4,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01, #0.02
+        ent_coef=0.02, #0.02;0.01
         target_kl=0.03,
         # ── 评估 ──
-        eval_freq=6_000,
+        eval_freq=5_000,
         n_eval_episodes=5,
         # ── 日志 ──
         log_dir="./satellite_maskppo_logs/",
-        save_dir="./satellite_maskppo_models_gnn/8sats",
+        save_dir="./satellite_maskppo_models_gnn/",
         seed=42,
         verbose=1,
         # 指定设备: "auto"(有 GPU 则用 GPU), "cuda:0", "cuda:1", "cpu"

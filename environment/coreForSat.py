@@ -1001,7 +1001,7 @@ class SatelliteWorld(object):
         c = 3e8  # 光速 m/s
 
         # 3. 信道参数 - 修正为更合理的值
-        B_ui = 8  # MHz，用户到卫星的通信带宽
+        B_ui = 1  # 8 MHz，用户到卫星的通信带宽
         P_u = 1     # W，用户发射功率
         # 修正信道增益系数，考虑自由空间路径损耗
         # 自由空间路径损耗: L = (4πd/λ)^2，其中λ = c/f，f ≈ 2GHz
@@ -1012,8 +1012,8 @@ class SatelliteWorld(object):
         # 自由空间路径损耗
         path_loss = (4 * np.pi * d_us_m / wavelength) ** 2
         # 假设用户终端天线增益 G_t_dBi = 10 dBi, 卫星天线增益 G_r_dBi = 41 dBi
-        G_t = 10**(5 / 10)  # 转换为线性值
-        G_r = 10**(20 / 10)  # 转换为线性值
+        G_t = 10**(5 / 10)  #5  转换为线性值
+        G_r = 10**(40 / 10)  #20  转换为线性值
         # 信道增益 = G_t * G_r/路径损耗
         h_ui = G_t * G_r / path_loss
         
@@ -1095,7 +1095,13 @@ class SatelliteWorld(object):
         else:
             E_tx = device.p_tx * Z_kbits * 1e3 / R_up
 
-        f_comp = sat.comp_resource / len(sat.service_users) * 1e9
+        f_comp_allocated = sat.comp_resource / len(sat.service_users) * 1e9
+
+        # 设置单任务最大可分配频率上限 (例如 2.0 GHz)
+        MAX_F_COMP = 3e9 # Hz
+        # 取实际分配值
+        f_comp = min(f_comp_allocated, MAX_F_COMP)
+
         E_comp = sat.kappa_sat * ((f_comp) ** 2) * total_cycles  #cycles
         # print(f"计算资源: {f_comp:.2e}cycles/s, 总CPU周期数: {total_cycles:.2e}cycles, 能耗系数: {sat.kappa_sat:.2e}J/cycles")
         # print(f"设备{device.id}, 卫星{sat.id}, 通信能耗: {E_tx:.2f}J, 计算能耗: {E_comp:.2f}J")
@@ -1335,59 +1341,59 @@ class SatelliteWorld(object):
     
 
     
-    def plot_step_positions(self, step_idx, save_dir="satellite_steps"):
+    # def plot_step_positions(self, step_idx, save_dir="satellite_steps"):
 
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
+    #     if not os.path.exists(save_dir):
+    #         os.makedirs(save_dir)
 
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
+    #     fig = plt.figure()
+    #     ax = fig.add_subplot(111, projection='3d')
 
-        # 1. 绘制地球球体
-        r = 6371  # 地球半径，单位km
-        u, v = np.mgrid[0:2*np.pi:40j, 0:np.pi:20j]
-        x = r * np.cos(u) * np.sin(v)
-        y = r * np.sin(u) * np.sin(v)
-        z = r * np.cos(v)
-        ax.plot_surface(x, y, z, color='deepskyblue', alpha=0.3)
+    #     # 1. 绘制地球球体
+    #     r = 6371  # 地球半径，单位km
+    #     u, v = np.mgrid[0:2*np.pi:40j, 0:np.pi:20j]
+    #     x = r * np.cos(u) * np.sin(v)
+    #     y = r * np.sin(u) * np.sin(v)
+    #     z = r * np.cos(v)
+    #     ax.plot_surface(x, y, z, color='deepskyblue', alpha=0.3)
 
-        # 2. 绘制所有卫星
-        sat_x, sat_y, sat_z = [], [], []
-        for sat in self.satellites:
-            pos = sat._satellite_pos(self.current_time)  # 获取当前step卫星位置
-            sat_x.append(pos[0])
-            sat_y.append(pos[1])
-            sat_z.append(pos[2])
-            ax.text(pos[0], pos[1], pos[2], f"S{sat.id}", fontsize=8, color='red')  # 标注卫星编号
-        ax.scatter(sat_x, sat_y, sat_z, c='red', marker='o', label='Satellites')
+    #     # 2. 绘制所有卫星
+    #     sat_x, sat_y, sat_z = [], [], []
+    #     for sat in self.satellites:
+    #         pos = sat._satellite_pos(self.current_time)  # 获取当前step卫星位置
+    #         sat_x.append(pos[0])
+    #         sat_y.append(pos[1])
+    #         sat_z.append(pos[2])
+    #         ax.text(pos[0], pos[1], pos[2], f"S{sat.id}", fontsize=8, color='red')  # 标注卫星编号
+    #     ax.scatter(sat_x, sat_y, sat_z, c='red', marker='o', label='Satellites')
 
-        # 3. 绘制所有用户
-        user_x, user_y, user_z = [], [], []
-        for user in self.user_clusters:
-            # 需实现经纬度到xyz的转换
-            lon, lat = user.lon, user.lat
-            pos = [
-                r * np.cos(np.radians(lat)) * np.cos(np.radians(lon)),
-                r * np.cos(np.radians(lat)) * np.sin(np.radians(lon)),
-                r * np.sin(np.radians(lat))
-            ]
-            user_x.append(pos[0])
-            user_y.append(pos[1])
-            user_z.append(pos[2])
-            ax.text(pos[0], pos[1], pos[2], f"U{user.id}", fontsize=8, color='green')  # 标注用户编号
-        ax.scatter(user_x, user_y, user_z, c='green', marker='^', label='Users')
+    #     # 3. 绘制所有用户
+    #     user_x, user_y, user_z = [], [], []
+    #     for user in self.user_clusters:
+    #         # 需实现经纬度到xyz的转换
+    #         lon, lat = user.lon, user.lat
+    #         pos = [
+    #             r * np.cos(np.radians(lat)) * np.cos(np.radians(lon)),
+    #             r * np.cos(np.radians(lat)) * np.sin(np.radians(lon)),
+    #             r * np.sin(np.radians(lat))
+    #         ]
+    #         user_x.append(pos[0])
+    #         user_y.append(pos[1])
+    #         user_z.append(pos[2])
+    #         ax.text(pos[0], pos[1], pos[2], f"U{user.id}", fontsize=8, color='green')  # 标注用户编号
+    #     ax.scatter(user_x, user_y, user_z, c='green', marker='^', label='Users')
 
-        # 设置视角
-        ax.view_init(elev=30, azim=60)
+    #     # 设置视角
+    #     ax.view_init(elev=30, azim=60)
 
-        ax.set_title(f"Step {step_idx} 卫星与用户三维分布")
-        ax.set_xlabel("X (km)")
-        ax.set_ylabel("Y (km)")
-        ax.set_zlabel("Z (km)")
-        ax.legend()
+    #     ax.set_title(f"Step {step_idx} 卫星与用户三维分布")
+    #     ax.set_xlabel("X (km)")
+    #     ax.set_ylabel("Y (km)")
+    #     ax.set_zlabel("Z (km)")
+    #     ax.legend()
 
-        plt.savefig(os.path.join(save_dir, f"satellite_step_{step_idx}.png"))
-        plt.close()
+    #     plt.savefig(os.path.join(save_dir, f"satellite_step_{step_idx}.png"))
+    #     plt.close()
 
     
 

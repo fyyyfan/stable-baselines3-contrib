@@ -12,6 +12,7 @@ SatelliteSingleAgentEnv 环境测试脚本
 import numpy as np
 import gymnasium as gym
 from satellite_single_agent_env import SatelliteSingleAgentEnv
+from satellite_env_gnn import SatelliteGNNEnv
 
 # ======================== 工具函数 ========================
 
@@ -221,11 +222,11 @@ def test_env_creation():
     
     print("\n[创建环境] 参数配置:")
     
-    env = SatelliteSingleAgentEnv(
+    env = SatelliteGNNEnv(
         num_satellites=4,
         num_users=10,
-        lambda0=0.5,
-        I_max=5,
+        lambda0=0.3,
+        I_max=6,
         max_steps=60
     )
     
@@ -271,7 +272,7 @@ def test_env_step(env: SatelliteSingleAgentEnv, num_steps: int = 10):
         # print_task_info(env)
         
         # 2. 打印卫星状态
-        print_satellite_info(env)
+        # print_satellite_info(env)
         
         # 3. 获取并打印动作掩码
         mask_matrix = print_action_masks(env)
@@ -282,6 +283,9 @@ def test_env_step(env: SatelliteSingleAgentEnv, num_steps: int = 10):
         # 5. 打印卸载决策
         # print_action_decision(env, action)
         
+        # 绘制图像
+        env.world.plot_step_positions_interactive(step)
+
         # 6. 执行 step
         print(f"\n[执行 step]...")
         obs, reward, terminated, truncated, info = env.step(action)
@@ -481,7 +485,7 @@ def main():
     
     # 测试3: 单步执行（详细打印）
     # env.reset(seed=42)  # 重置环境
-    test_env_step(env, num_steps=60)
+    test_env_step(env, num_steps=5)
 
     
     # # 测试4: 动作空间有效性

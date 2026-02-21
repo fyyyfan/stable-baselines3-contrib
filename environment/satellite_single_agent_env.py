@@ -105,9 +105,22 @@ class SatelliteSingleAgentEnv(gym.Env):
 
         # ===================== 奖励权重 =====================
         # 第一组10,1.0
+        # 第二组1.0,0.3 （稳定版2.19之前的实验参数）
+        # 第三组 2.0 0.3
         self.delay_weight = 1.0
-        self.energy_weight = 0.3
+        self.energy_weight = 1.0
         self.overflow_penalty = 1.0
+        
+        # 归一化基准范围（估计值，用于 min-max 归一化）
+        self.delay_min = 0.05
+        self.delay_max = 0.30
+        self.energy_min = 0.02
+        self.energy_max = 1.0
+
+        # 运行时统计追踪（仅用于日志/校准，不参与奖励计算）
+        self._delay_ema = 0.1
+        self._energy_ema = 0.3
+        self._ema_alpha = 0.02
 
         # ===================== 运行时状态 =====================
         self.current_step = 0
@@ -361,11 +374,11 @@ class SatelliteSingleAgentEnv(gym.Env):
             device = IoTDevice(
                 id=uid,
                 lon = int(np.random.uniform(100, 130)), #lon=lon[uid]
-                lat = int(np.random.uniform(30, 50)), #lat=lat[uid]
+                lat = int(np.random.uniform(40, 55)), #lat=lat[uid]
                 lambda0=self.lambda0,
                 f_local=2,
                 p_tx=0.5,
-                kappa_ue=5e-28
+                kappa_ue=3e-28
             )
             self.world.user_clusters.append(device)
 
@@ -434,6 +447,7 @@ class SatelliteSingleAgentEnv(gym.Env):
         total_delay = 0.0
         total_energy = 0.0
         overflow_count = 0
+        total_reward = 0.0
         num_tasks_decided = min(len(self.current_task_pool), self.I_max)
 
         for i in range(num_tasks_decided):
@@ -448,8 +462,22 @@ class SatelliteSingleAgentEnv(gym.Env):
             # TODO:奖励计算待修改
             total_delay += delay_i
             total_energy += energy_i
+
+            # ---- 逐任务归一化奖励 ----
+            # delay_norm = self._normalize_cost(delay_i, self.delay_min, self.delay_max)
+            # energy_norm = self._normalize_cost(energy_i, self.energy_min, self.energy_max)
+
+            # task_cost = (self.delay_weight * delay_norm
+            #              + self.energy_weight * energy_norm)
+            task_cost = 1 * delay_i + 0.5 * energy_i
+            if self.verbose:
+                print(f"任务{i}归一化奖励: {task_cost:.2f}")
+
             if overflow_i:
+                task_cost += self.overflow_penalty
                 overflow_count += 1
+            # 将每个任务归一化后的奖励累计到 total_reward，整体为负值
+            total_reward -= task_cost
 
         # ===========消耗卫星节点队列中的任务，通过消耗 w.dt 计算量，任务完成后更新 service_users）
         for sat in w.satellites[: self.num_satellites]:
@@ -467,9 +495,19 @@ class SatelliteSingleAgentEnv(gym.Env):
         if num_tasks_decided == 0:
             reward = 0.0
         else:
-            reward = -(self.delay_weight * total_delay
-                   + self.energy_weight * total_energy
-                   + self.overflow_penalty * overflow_count) / num_tasks_decided
+            reward = total_reward / num_tasks_decided
+            # 原奖励函数
+            # reward = -(self.delay_weight * total_delay
+            #        + self.energy_weight * total_energy
+            #        + self.overflow_penalty * overflow_count) / num_tasks_decided
+
+        # 更新 EMA 统计（仅用于日志监控）
+        if num_tasks_decided > 0:
+            avg_d = total_delay / num_tasks_decided
+            avg_e = total_energy / num_tasks_decided
+            self._delay_ema += self._ema_alpha * (avg_d - self._delay_ema)
+            self._energy_ema += self._ema_alpha * (avg_e - self._energy_ema)
+
         if self.verbose:
             print(f"\n[奖励计算] total_delay={total_delay:.2f}s, total_energy={total_energy:.2f}J, "
                   f"overflow_count={overflow_count}, reward={reward:.2f}")
@@ -498,9 +536,32 @@ class SatelliteSingleAgentEnv(gym.Env):
             "total_energy": float(total_energy),
             "overflow_count": int(overflow_count),
             "num_tasks": num_tasks_decided,
+            "delay_ema": float(self._delay_ema),
+            "energy_ema": float(self._energy_ema),
         })
 
         return observation, reward, terminated, truncated, info
+
+    # ======================== 奖励归一化 ========================
+
+    def _normalize_cost(self, x: float, x_min: float, x_max: float) -> float:
+        """
+        将代价指标归一化到 [0, ~2) 区间。
+        
+        [x_min, x_max] 内线性映射到 [0, 1]；
+        超过 x_max 的部分用 tanh 压缩到 (1, 2)，保证梯度非零但不爆炸；
+        低于 x_min 的部分截断为 0。
+        """
+        span = x_max - x_min
+        if span <= 0:
+            return 0.0
+        normalized = (x - x_min) / span
+        if normalized < 0.0:
+            return 0.0
+        elif normalized <= 1.0:
+            return float(normalized)
+        else:
+            return 1.0 + float(np.tanh(normalized - 1.0))
 
     # ======================== 内部辅助方法 ========================
 
