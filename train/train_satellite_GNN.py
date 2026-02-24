@@ -581,13 +581,13 @@ if __name__ == "__main__":
     trained_model = train(
         # ── 环境 ──
         num_satellites=4, #4;8
-        num_users=10,
-        lambda0=0.3,
-        I_max=6,
+        num_users=20, #10
+        lambda0=0.25, #0.3
+        I_max=10, #6
         max_steps=60,
         env_update_interval=5,
         # ── 并行 ──
-        n_envs=4, #4;6
+        n_envs=6, #4;6
         vec_env_cls="subproc",
         # ── GNN ──
         gnn_features_dim=128, #128;256
@@ -596,18 +596,18 @@ if __name__ == "__main__":
         gnn_num_heads=4,
         gnn_dropout=0.0,
         # ── 训练 ──
-        total_timesteps=800_000,
-        n_steps=512, #256;1024
-        batch_size=128, #64;256
+        total_timesteps=1000_000,
+        n_steps=1024, #256;1024
+        batch_size=256, #64;256
         n_epochs=5, #5;10
-        learning_rate=3e-4, #3e-4,
+        learning_rate=3e-4, #3e-4, 1e-4
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.02, #0.02;0.01
         target_kl=0.03,
         # ── 评估 ──
-        eval_freq=5_000,
+        eval_freq=10_000,
         n_eval_episodes=5,
         # ── 日志 ──
         log_dir="./satellite_maskppo_logs/",

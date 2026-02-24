@@ -943,7 +943,7 @@ class SatelliteWorld(object):
             if d > 0 and d < best_dist:
                 best_dist = d
                 best_sat = s
-            cloud.current_sat = best_sat
+        cloud.current_sat = best_sat
 
     def _update_device_current_sat(self, device: IoTDevice):
         """

@@ -174,9 +174,9 @@ class HeteroGATBlock(nn.Module):
         self.gat_sat_to_task = DenseGATv2Layer(
             hidden_dim, hidden_dim, num_heads, edge_dim, dropout
         )
-        self.gat_sat_to_sat = DenseGATv2Layer(
-            hidden_dim, hidden_dim, num_heads, edge_dim, dropout
-        )
+        # self.gat_sat_to_sat = DenseGATv2Layer(
+        #     hidden_dim, hidden_dim, num_heads, edge_dim, dropout
+        # )
 
         self.norm_task = nn.LayerNorm(hidden_dim)
         self.norm_sat = nn.LayerNorm(hidden_dim)
@@ -188,8 +188,8 @@ class HeteroGATBlock(nn.Module):
         sat_h: torch.Tensor,
         task_sat_adj: torch.Tensor,
         task_sat_feat: torch.Tensor,
-        sat_sat_adj: torch.Tensor,
-        sat_sat_feat: torch.Tensor,
+        # sat_sat_adj: torch.Tensor,
+        # sat_sat_feat: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         一步异构消息传递。
@@ -199,8 +199,8 @@ class HeteroGATBlock(nn.Module):
             sat_h:         (B, M, d)     卫星节点嵌入
             task_sat_adj:  (B, I_max, M) 任务→卫星邻接矩阵
             task_sat_feat: (B, I_max, M, edge_dim) 任务→卫星边特征
-            sat_sat_adj:   (B, M, M)     卫星→卫星邻接矩阵
-            sat_sat_feat:  (B, M, M, edge_dim) 卫星→卫星边特征
+            # sat_sat_adj:   (B, M, M)     卫星→卫星邻接矩阵
+            # sat_sat_feat:  (B, M, M, edge_dim) 卫星→卫星边特征
 
         Returns:
             new_task_h: (B, I_max, d) 更新后的任务嵌入
@@ -219,14 +219,17 @@ class HeteroGATBlock(nn.Module):
             sat_h, task_h, adj_rev, feat_rev
         )
 
-        # ── sat → sat: 卫星聚合来自 ISL 邻居的信息 ──
-        msg_sat_to_sat = self.gat_sat_to_sat(
-            sat_h, sat_h, sat_sat_adj, sat_sat_feat
-        )
+        # # ── sat → sat: 卫星聚合来自 ISL 邻居的信息 ──
+        # msg_sat_to_sat = self.gat_sat_to_sat(
+        #     sat_h, sat_h, sat_sat_adj, sat_sat_feat
+        # )
 
         # ── 残差连接 + LayerNorm ──
+        # new_sat_h = self.norm_sat(
+        #     sat_h + self.act(msg_task_to_sat + msg_sat_to_sat)
+        # )
         new_sat_h = self.norm_sat(
-            sat_h + self.act(msg_task_to_sat + msg_sat_to_sat)
+            sat_h + self.act(msg_task_to_sat)
         )
         new_task_h = self.norm_task(
             task_h + self.act(msg_sat_to_task)
@@ -332,9 +335,9 @@ class GNNFeaturesExtractor(BaseFeaturesExtractor):
         task_sat_adj  = observations["task_sat_adj"]       # (B, I_max, M+1)
         task_sat_dist = observations["task_sat_dist"]      # (B, I_max, M+1)
         task_sat_rate = observations["task_sat_rate"]      # (B, I_max, M+1)
-        sat_sat_adj   = observations["sat_sat_adj"]        # (B, M+1, M+1)
-        sat_sat_dist  = observations["sat_sat_dist"]       # (B, M+1, M+1)
-        sat_sat_rate  = observations["sat_sat_rate"]       # (B, M+1, M+1)
+        # sat_sat_adj   = observations["sat_sat_adj"]        # (B, M+1, M+1)
+        # sat_sat_dist  = observations["sat_sat_dist"]       # (B, M+1, M+1)
+        # sat_sat_rate  = observations["sat_sat_rate"]       # (B, M+1, M+1)
         num_tasks     = observations["num_tasks"]          # (B, 1)
 
         B = sat_feat.shape[0]
@@ -343,9 +346,9 @@ class GNNFeaturesExtractor(BaseFeaturesExtractor):
         task_sat_edge_feat = torch.stack(
             [task_sat_dist, task_sat_rate], dim=-1
         )  # (B, I_max, M, 2)
-        sat_sat_edge_feat = torch.stack(
-            [sat_sat_dist, sat_sat_rate], dim=-1
-        )  # (B, M, M, 2)
+        # sat_sat_edge_feat = torch.stack(
+        #     [sat_sat_dist, sat_sat_rate], dim=-1
+        # )  # (B, M, M, 2)
 
         # ── 2. 节点特征编码 ──
         task_h = self.task_encoder(task_feat)  # (B, I_max, hidden_dim)
@@ -353,10 +356,14 @@ class GNNFeaturesExtractor(BaseFeaturesExtractor):
 
         # ── 3. 多层异构 GAT 消息传递 ──
         for gnn_layer in self.gnn_layers:
+            # task_h, sat_h = gnn_layer(
+            #     task_h, sat_h,
+            #     task_sat_adj, task_sat_edge_feat,
+            #     sat_sat_adj, sat_sat_edge_feat,
+            # )
             task_h, sat_h = gnn_layer(
                 task_h, sat_h,
-                task_sat_adj, task_sat_edge_feat,
-                sat_sat_adj, sat_sat_edge_feat,
+                task_sat_adj, task_sat_edge_feat
             )
 
         # ── 4. Readout ──

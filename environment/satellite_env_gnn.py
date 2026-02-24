@@ -90,21 +90,21 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
                 low=0.0, high=np.inf,
                 shape=(I_max, M + 1), dtype=np.float32
             ),
-            # 卫星间 ISL 邻接矩阵 (二值), 含云端节点 (索引 M, 全零行列)
-            "sat_sat_adj": spaces.Box(
-                low=0.0, high=1.0,
-                shape=(M + 1, M + 1), dtype=np.float32
-            ),
-            # 卫星间归一化距离, 含云端节点
-            "sat_sat_dist": spaces.Box(
-                low=0.0, high=np.inf,
-                shape=(M + 1, M + 1), dtype=np.float32
-            ),
-            # 卫星间 ISL 数据传输速率, 含云端节点
-            "sat_sat_rate": spaces.Box(
-                low=0.0, high=np.inf,
-                shape=(M + 1, M + 1), dtype=np.float32
-            ),
+            # # 卫星间 ISL 邻接矩阵 (二值), 含云端节点 (索引 M, 全零行列)
+            # "sat_sat_adj": spaces.Box(
+            #     low=0.0, high=1.0,
+            #     shape=(M + 1, M + 1), dtype=np.float32
+            # ),
+            # # 卫星间归一化距离, 含云端节点
+            # "sat_sat_dist": spaces.Box(
+            #     low=0.0, high=np.inf,
+            #     shape=(M + 1, M + 1), dtype=np.float32
+            # ),
+            # # 卫星间 ISL 数据传输速率, 含云端节点
+            # "sat_sat_rate": spaces.Box(
+            #     low=0.0, high=np.inf,
+            #     shape=(M + 1, M + 1), dtype=np.float32
+            # ),
             # 实际任务数 (归一化到 [0, 1])
             "num_tasks": spaces.Box(
                 low=0.0, high=1.0,
@@ -209,20 +209,20 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
                 task_sat_dist[i, M] = self.world.get_backhaul_distance(device, self.world.cloud_server, best_sat) / 1e4
                 task_sat_rate[i, M]= self.world._transmission_rate(self.world.cloud_server, task, cloud_current_sat) / 1e7
 
-        # ============================================================
-        # 4. sat→sat 边 (星间链路 ISL)
-        #    来源: self.world.sat_links
-        #    边特征: [normalized_distance, data_rate]
-        # ============================================================
-        sat_sat_adj  = np.zeros((M + 1, M + 1), dtype=np.float32)
-        sat_sat_dist = np.zeros((M + 1, M + 1), dtype=np.float32)
-        sat_sat_rate = np.zeros((M + 1, M + 1), dtype=np.float32)
+        # # ============================================================
+        # # 4. sat→sat 边 (星间链路 ISL)
+        # #    来源: self.world.sat_links
+        # #    边特征: [normalized_distance, data_rate]
+        # # ============================================================
+        # sat_sat_adj  = np.zeros((M + 1, M + 1), dtype=np.float32)
+        # sat_sat_dist = np.zeros((M + 1, M + 1), dtype=np.float32)
+        # sat_sat_rate = np.zeros((M + 1, M + 1), dtype=np.float32)
 
-        for (s1, s2), link_info in w.sat_links.items():
-            if 0 <= s1 < M and 0 <= s2 < M:
-                sat_sat_adj[s1, s2]  = 1.0
-                sat_sat_dist[s1, s2] = link_info["distance"] / 1e4   # km → 归一化
-                sat_sat_rate[s1, s2] = link_info["data_rate"] / 1e9   # bit/s → Gbps
+        # for (s1, s2), link_info in w.sat_links.items():
+        #     if 0 <= s1 < M and 0 <= s2 < M:
+        #         sat_sat_adj[s1, s2]  = 1.0
+        #         sat_sat_dist[s1, s2] = link_info["distance"] / 1e4   # km → 归一化
+        #         sat_sat_rate[s1, s2] = link_info["data_rate"] / 1e9   # bit/s → Gbps
 
         # ============================================================
         # 5. 实际任务数 (归一化)
@@ -237,8 +237,8 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
             "task_sat_adj":  task_sat_adj,
             "task_sat_dist": task_sat_dist,
             "task_sat_rate": task_sat_rate,
-            "sat_sat_adj":   sat_sat_adj,
-            "sat_sat_dist":  sat_sat_dist,
-            "sat_sat_rate":  sat_sat_rate,
+            # "sat_sat_adj":   sat_sat_adj,
+            # "sat_sat_dist":  sat_sat_dist,
+            # "sat_sat_rate":  sat_sat_rate,
             "num_tasks":     num_tasks,
         }
