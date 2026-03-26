@@ -184,7 +184,8 @@ class IoTDevice(UserCluster):
             z_i = int(np.random.uniform(5, 10)) * 1e2  
             
             # k_i: 计算密度，均匀分布 [] Gcycles/kbit
-            k_i = int(np.random.uniform(2, 10)) * 1e-4
+            # k_i = int(np.random.uniform(2, 10)) * 1e-4
+            k_i = 6e-4
             
             # D_i
             d_i = 3
@@ -1066,15 +1067,27 @@ class SatelliteWorld(object):
         - R_up: 上行速率 (bit/s)
         - distance_km: 星地距离 (km)
         """
-        total_cycles = task.task_size * task.computing_requirement
+        total_cycles = task.task_size * task.computing_requirement #Gcycle
         # 通信延迟
         T_comm = self._compute_communication_delay(device, task, sat)
         # 排队延迟
         T_queue = sat.get_queue_delay()
         # 计算延迟
-        f_comp = sat.comp_resource / len(sat.service_users)
+        # # 设置单任务最大可分配频率上限 (例如 2.0 GHz)
+        # MAX_F_COMP = 2 # GHz
+        # if len(sat.service_users) > 0:
+        #     f_comp_allocated = sat.comp_resource / len(sat.service_users) 
+        # else:
+        #     f_comp_allocated = MAX_F_COMP
+        # # 取实际分配值
+        # f_comp = min(f_comp_allocated, MAX_F_COMP)
+        if len(sat.service_users) > 0:
+            f_comp = sat.comp_resource / len(sat.service_users)
+        else:
+            # f_comp = min(sat.comp_resource, 5) # GHz
+            f_comp = sat.comp_resource
         T_comp = total_cycles / f_comp
-        # print(f"设备{device.id}, 卫星{sat.id}, 通信延迟: {T_comm:.2f}s, 排队延迟: {T_queue:.2f}s, 计算延迟: {T_comp:.2f}s")
+        # print(f"设备{device.id}, 卫星{sat.id}, 通信延迟: {T_comm:.4f}s, 排队延迟: {T_queue:.4f}s, 计算延迟: {T_comp:.4f}s")
 
         return T_comm + T_queue + T_comp
 
@@ -1095,16 +1108,18 @@ class SatelliteWorld(object):
         else:
             E_tx = device.p_tx * Z_kbits * 1e3 / R_up
 
-        f_comp_allocated = sat.comp_resource / len(sat.service_users) * 1e9
-
         # 设置单任务最大可分配频率上限 (例如 2.0 GHz)
-        MAX_F_COMP = 3e9 # Hz
+        MAX_F_COMP = 2e9 # Hz
+        if len(sat.service_users) > 0:
+            f_comp_allocated = sat.comp_resource / len(sat.service_users) * 1e9
+        else:
+            f_comp_allocated = MAX_F_COMP
         # 取实际分配值
         f_comp = min(f_comp_allocated, MAX_F_COMP)
 
         E_comp = sat.kappa_sat * ((f_comp) ** 2) * total_cycles  #cycles
         # print(f"计算资源: {f_comp:.2e}cycles/s, 总CPU周期数: {total_cycles:.2e}cycles, 能耗系数: {sat.kappa_sat:.2e}J/cycles")
-        # print(f"设备{device.id}, 卫星{sat.id}, 通信能耗: {E_tx:.2f}J, 计算能耗: {E_comp:.2f}J")
+        # print(f"设备{device.id}, 卫星{sat.id}, 通信能耗: {E_tx:.3f}J, 计算能耗: {E_comp:.3f}J")
         return E_tx + E_comp
 
 
@@ -1139,6 +1154,7 @@ class SatelliteWorld(object):
         
         path_sat_ids = self.get_ISL_path(sat1, cloud.current_sat)
         total = 0.0
+        total += self.user_sat_visibility.get((device.id, sat1.id))
         for u, v in zip(path_sat_ids[:-1], path_sat_ids[1:]):
             link = self.sat_links.get((u, v))
             if link is None:
@@ -1208,7 +1224,7 @@ class SatelliteWorld(object):
 
     def compute_cloud_energy(self, device: IoTDevice,
                              task: Task, cloud: CloudServer,
-                             P_ISL: float = 1.0,
+                             P_ISL: float = 3.0,
                              ) -> float:
         """
         总能耗 = 上行数据传输能耗 + 卫星中继能耗
@@ -1243,7 +1259,7 @@ class SatelliteWorld(object):
         else:
             E_tx = device.p_tx * Z_bits *1e3 / R_up
         # print(f"设备{device.id}, 云端上行能耗: {E_tx:.2f}J, ISL能耗: {backhaul_energy:.2f}J")
-        return E_tx + backhaul_energy
+        return 3*E_tx + backhaul_energy
 
 
 

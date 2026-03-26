@@ -1,3 +1,5 @@
+import os
+from numbers import Number
 from typing import Any, ClassVar, TypeVar
 
 import numpy as np
@@ -18,6 +20,49 @@ from sb3_contrib.common.maskable.utils import get_action_masks, is_masking_suppo
 from sb3_contrib.ppo_mask.policies import CnnPolicy, MlpPolicy, MultiInputPolicy
 
 SelfMaskablePPO = TypeVar("SelfMaskablePPO", bound="MaskablePPO")
+
+
+def _finite_assert_enabled() -> bool:
+    return os.environ.get("SB3_FINITE_ASSERT", "1") != "0"
+
+
+def _assert_all_finite(name: str, value: Any) -> None:
+    if isinstance(value, dict):
+        for key, sub_value in value.items():
+            _assert_all_finite(f"{name}.{key}", sub_value)
+        return
+    if isinstance(value, (list, tuple)):
+        for idx, sub_value in enumerate(value):
+            _assert_all_finite(f"{name}[{idx}]", sub_value)
+        return
+    if isinstance(value, th.Tensor):
+        if not th.isfinite(value).all():
+            raise AssertionError(
+                f"[FiniteAssert] {name} contains NaN/Inf, "
+                f"shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device}"
+            )
+        return
+    if isinstance(value, np.ndarray):
+        if not np.isfinite(value).all():
+            raise AssertionError(
+                f"[FiniteAssert] {name} contains NaN/Inf, "
+                f"shape={value.shape}, dtype={value.dtype}"
+            )
+        return
+    if isinstance(value, (np.generic, Number)):
+        if not np.isfinite(value):
+            raise AssertionError(f"[FiniteAssert] {name} is not finite: {value}")
+
+
+def _assert_infos_finite(name: str, infos: list[dict[str, Any]]) -> None:
+    for i, info in enumerate(infos):
+        for key, val in info.items():
+            if isinstance(val, dict):
+                for sub_key, sub_val in val.items():
+                    if isinstance(sub_val, (np.ndarray, np.generic, Number)):
+                        _assert_all_finite(f"{name}[{i}].{key}.{sub_key}", sub_val)
+            elif isinstance(val, (np.ndarray, np.generic, Number)):
+                _assert_all_finite(f"{name}[{i}].{key}", val)
 
 
 class MaskablePPO(OnPolicyAlgorithm):
@@ -220,17 +265,33 @@ class MaskablePPO(OnPolicyAlgorithm):
 
         while n_steps < n_rollout_steps:
             with th.no_grad():
+                if _finite_assert_enabled():
+                    _assert_all_finite("collect_rollouts.last_obs", self._last_obs)
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
+                if _finite_assert_enabled():
+                    _assert_all_finite("collect_rollouts.obs_tensor", obs_tensor)
 
                 # This is the only change related to invalid action masking
                 if use_masking:
                     action_masks = get_action_masks(env)
+                    if _finite_assert_enabled():
+                        _assert_all_finite("collect_rollouts.action_masks", action_masks)
 
                 actions, values, log_probs = self.policy(obs_tensor, action_masks=action_masks)
+                if _finite_assert_enabled():
+                    _assert_all_finite("collect_rollouts.actions_torch", actions)
+                    _assert_all_finite("collect_rollouts.values", values)
+                    _assert_all_finite("collect_rollouts.log_probs", log_probs)
 
             actions = actions.cpu().numpy()
+            if _finite_assert_enabled():
+                _assert_all_finite("collect_rollouts.actions_numpy", actions)
             new_obs, rewards, dones, infos = env.step(actions)
+            if _finite_assert_enabled():
+                _assert_all_finite("collect_rollouts.new_obs", new_obs)
+                _assert_all_finite("collect_rollouts.rewards", rewards)
+                _assert_infos_finite("collect_rollouts.infos", infos)
 
             self.num_timesteps += env.num_envs
 
@@ -254,9 +315,16 @@ class MaskablePPO(OnPolicyAlgorithm):
                     and infos[idx].get("terminal_observation") is not None
                     and infos[idx].get("TimeLimit.truncated", False)
                 ):
+                    if _finite_assert_enabled():
+                        _assert_all_finite(
+                            f"collect_rollouts.terminal_observation[{idx}]",
+                            infos[idx]["terminal_observation"],
+                        )
                     terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
                     with th.no_grad():
                         terminal_value = self.policy.predict_values(terminal_obs)[0]
+                    if _finite_assert_enabled():
+                        _assert_all_finite(f"collect_rollouts.terminal_value[{idx}]", terminal_value)
                     rewards[idx] += self.gamma * terminal_value
 
             rollout_buffer.add(
@@ -276,6 +344,8 @@ class MaskablePPO(OnPolicyAlgorithm):
             # Masking is not needed here, the choice of action doesn't matter.
             # We only want the value of the current observation.
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
+            if _finite_assert_enabled():
+                _assert_all_finite("collect_rollouts.last_values", values)
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 

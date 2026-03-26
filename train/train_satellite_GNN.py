@@ -50,7 +50,7 @@ os.environ["PYTHONPATH"] = (
 )
 
 from environment.satellite_env_gnn import SatelliteGNNEnv
-from train.gnn_encoder import GNNFeaturesExtractor
+from train.gnn_encoder_egnn import GNNFeaturesExtractor
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.evaluation import evaluate_policy
@@ -197,7 +197,7 @@ class SatelliteEvalCallback(MaskableEvalCallback):
                     print("New best mean reward!")
                 if self.best_model_save_path is not None:
                     self.model.save(
-                        os.path.join(self.best_model_save_path, "best_model")
+                        os.path.join(self.best_model_save_path, "best_model_lr1e-4")
                     )
                 self.best_mean_reward = float(mean_reward)
                 if self.callback_on_new_best is not None:
@@ -438,9 +438,10 @@ def train(
             hidden_dim=gnn_hidden_dim,
             num_gnn_layers=gnn_num_layers,
             num_heads=gnn_num_heads,
-            edge_dim=2,       # [distance, rate]
+            edge_dim=1,       # [distance, rate]
             dropout=gnn_dropout,
         ),
+        share_features_extractor=False,
         net_arch=dict(pi=[128, 64], vf=[128, 64]),
     )
 
@@ -581,18 +582,18 @@ if __name__ == "__main__":
     trained_model = train(
         # ── 环境 ──
         num_satellites=4, #4;8
-        num_users=20, #10
-        lambda0=0.25, #0.3
-        I_max=10, #6
+        num_users=10, #10 20
+        lambda0=0.3, #0.3 0.25
+        I_max=6, #6 10
         max_steps=60,
         env_update_interval=5,
         # ── 并行 ──
-        n_envs=6, #4;6
+        n_envs=4, #4;6
         vec_env_cls="subproc",
         # ── GNN ──
         gnn_features_dim=128, #128;256
         gnn_hidden_dim=64, #64;128
-        gnn_num_layers=2,
+        gnn_num_layers=1, #2
         gnn_num_heads=4,
         gnn_dropout=0.0,
         # ── 训练 ──
@@ -600,7 +601,7 @@ if __name__ == "__main__":
         n_steps=1024, #256;1024
         batch_size=256, #64;256
         n_epochs=5, #5;10
-        learning_rate=3e-4, #3e-4, 1e-4
+        learning_rate=3e-4, #3e-4, 1e-3
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,

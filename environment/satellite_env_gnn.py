@@ -64,16 +64,16 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
 
         # ── 覆盖观测空间为 Dict ──
         self.observation_space = spaces.Dict({
-            # 卫星节点特征: [comp_resource], 外加云端数据中心节点特征
+            # 卫星节点特征: [comp_resource, remaining_capacity_ratio]
             "sat_features": spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(M + 1, 1), dtype=np.float32
+                shape=(M + 1, 2), dtype=np.float32
             ),
             
             # 任务节点特征: [task_size, cycles, deadline, is_real_task]
             "task_features": spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(I_max, 4), dtype=np.float32
+                shape=(I_max, 3), dtype=np.float32
             ),
             # 任务→卫星邻接矩阵 (二值: 1=可见, 0=不可见)
             "task_sat_adj": spaces.Box(
@@ -90,21 +90,21 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
                 low=0.0, high=np.inf,
                 shape=(I_max, M + 1), dtype=np.float32
             ),
-            # # 卫星间 ISL 邻接矩阵 (二值), 含云端节点 (索引 M, 全零行列)
-            # "sat_sat_adj": spaces.Box(
-            #     low=0.0, high=1.0,
-            #     shape=(M + 1, M + 1), dtype=np.float32
-            # ),
-            # # 卫星间归一化距离, 含云端节点
-            # "sat_sat_dist": spaces.Box(
-            #     low=0.0, high=np.inf,
-            #     shape=(M + 1, M + 1), dtype=np.float32
-            # ),
-            # # 卫星间 ISL 数据传输速率, 含云端节点
-            # "sat_sat_rate": spaces.Box(
-            #     low=0.0, high=np.inf,
-            #     shape=(M + 1, M + 1), dtype=np.float32
-            # ),
+            # 卫星间 ISL 邻接矩阵 (二值), 含云端节点 (索引 M, 全零行列)
+            "sat_sat_adj": spaces.Box(
+                low=0.0, high=1.0,
+                shape=(M + 1, M + 1), dtype=np.float32
+            ),
+            # 卫星间归一化距离, 含云端节点
+            "sat_sat_dist": spaces.Box(
+                low=0.0, high=np.inf,
+                shape=(M + 1, M + 1), dtype=np.float32
+            ),
+            # 卫星间 ISL 数据传输速率, 含云端节点
+            "sat_sat_rate": spaces.Box(
+                low=0.0, high=np.inf,
+                shape=(M + 1, M + 1), dtype=np.float32
+            ),
             # 实际任务数 (归一化到 [0, 1])
             "num_tasks": spaces.Box(
                 low=0.0, high=1.0,
@@ -148,27 +148,34 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
         w = self.world
 
         # ============================================================
-        # 1. 卫星节点特征: [comp_resource], 外加云端数据中心节点特征
+        # 1. 卫星节点特征: [comp_resource, remaining_capacity_ratio]
+        #    comp_resource:             处理速率 (GCycles/s)，归一化
+        #    remaining_capacity_ratio:  (buffer_capacity - queue_backlog) / buffer_capacity
+        #                               1.0 = 空闲，0.0 = 满载
         # ============================================================
-        sat_features = np.zeros((M + 1, 1), dtype=np.float32)
+        sat_features = np.zeros((M + 1, 2), dtype=np.float32)
         for j in range(M):
             sat = w.satellites[j]
             if isinstance(sat, SatMECNode):
-                
-                sat_features[j, 0] = sat.comp_resource / 10       # 归一化
-        sat_features[M, 0] = w.cloud_server.f_cloud / 10       # 归一化
+                sat_features[j, 0] = sat.comp_resource / 10
+                if sat.buffer_capacity > 0:
+                    sat_features[j, 1] = (sat.buffer_capacity - sat.queue_backlog) / sat.buffer_capacity
+                else:
+                    sat_features[j, 1] = 0.0
+        sat_features[M, 0] = w.cloud_server.f_cloud / 10
+        sat_features[M, 1] = 1.0  # 云端视为无限容量，剩余比率恒为 1
         # ============================================================
         # 2. 任务节点特征: [task_size, cycles, deadline, is_real_task]
         # ============================================================
-        task_features = np.zeros((I_max, 4), dtype=np.float32)
+        task_features = np.zeros((I_max, 3), dtype=np.float32)
         num_real_tasks = min(len(self.current_task_pool), I_max)
 
         for i in range(num_real_tasks):
             _, task = self.current_task_pool[i]
             task_features[i, 0] = float(task.task_size) / 1e3         # kbits → 归一化
             task_features[i, 1] = float(task.total_cpu_cycles())  # Gcycles → 归一化
-            task_features[i, 2] = float(task.delay_requirement) / 10.0  # s → 归一化
-            task_features[i, 3] = 1.0   # is_real_task
+            # task_features[i, 2] = float(task.delay_requirement) / 10.0  # s → 归一化
+            task_features[i, 2] = 1.0   # is_real_task
         # 超出 num_real_tasks 的槽位保持 0 (is_real_task=0)
 
         # ============================================================
@@ -195,9 +202,13 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
                 dist = w.user_sat_visibility.get((device.id, j), -1)
                 if dist > 0:
                     task_sat_adj[i, j] = 1.0
-                    task_sat_dist[i, j] = dist / 1e4             # km → 归一化
+                    dist_norm = float(dist / 1e4)                # km → 归一化
                     rate = w._transmission_rate(device, task, w.satellites[j])
-                    task_sat_rate[i, j] = rate / 1e7             # bit/s → Mbps
+                    rate_norm = float(rate / 1e7)                # bit/s → Mbps
+                    if np.isfinite(dist_norm):
+                        task_sat_dist[i, j] = dist_norm
+                    if np.isfinite(rate_norm):
+                        task_sat_rate[i, j] = rate_norm
             #单独处理云端节点
             best_sat = device_best_sat_cache.get(device.id)
             if best_sat is None or cloud_current_sat is None:
@@ -205,24 +216,36 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
                 task_sat_dist[i, M] = 0.0
                 task_sat_rate[i, M] = 0.0
             else:
-                task_sat_adj[i, M] = 1.0
-                task_sat_dist[i, M] = self.world.get_backhaul_distance(device, self.world.cloud_server, best_sat) / 1e4
-                task_sat_rate[i, M]= self.world._transmission_rate(self.world.cloud_server, task, cloud_current_sat) / 1e7
+                cloud_dist = float(
+                    self.world.get_backhaul_distance(device, self.world.cloud_server, best_sat) / 1e4
+                )
+                cloud_rate = float(
+                    self.world._transmission_rate(self.world.cloud_server, task, cloud_current_sat) / 1e7
+                )
+                # 云端路径不可达时禁止该动作，并保持观测为有限值，避免 NaN/Inf 污染网络。
+                if np.isfinite(cloud_dist) and np.isfinite(cloud_rate) and cloud_rate > 0.0:
+                    task_sat_adj[i, M] = 1.0
+                    task_sat_dist[i, M] = cloud_dist
+                    task_sat_rate[i, M] = cloud_rate
+                else:
+                    task_sat_adj[i, M] = 0.0
+                    task_sat_dist[i, M] = 0.0
+                    task_sat_rate[i, M] = 0.0
 
-        # # ============================================================
-        # # 4. sat→sat 边 (星间链路 ISL)
-        # #    来源: self.world.sat_links
-        # #    边特征: [normalized_distance, data_rate]
-        # # ============================================================
-        # sat_sat_adj  = np.zeros((M + 1, M + 1), dtype=np.float32)
-        # sat_sat_dist = np.zeros((M + 1, M + 1), dtype=np.float32)
-        # sat_sat_rate = np.zeros((M + 1, M + 1), dtype=np.float32)
+        # ============================================================
+        # 4. sat→sat 边 (星间链路 ISL)
+        #    来源: self.world.sat_links
+        #    边特征: [normalized_distance, data_rate]
+        # ============================================================
+        sat_sat_adj  = np.zeros((M + 1, M + 1), dtype=np.float32)
+        sat_sat_dist = np.zeros((M + 1, M + 1), dtype=np.float32)
+        sat_sat_rate = np.zeros((M + 1, M + 1), dtype=np.float32)
 
-        # for (s1, s2), link_info in w.sat_links.items():
-        #     if 0 <= s1 < M and 0 <= s2 < M:
-        #         sat_sat_adj[s1, s2]  = 1.0
-        #         sat_sat_dist[s1, s2] = link_info["distance"] / 1e4   # km → 归一化
-        #         sat_sat_rate[s1, s2] = link_info["data_rate"] / 1e9   # bit/s → Gbps
+        for (s1, s2), link_info in w.sat_links.items():
+            if 0 <= s1 < M and 0 <= s2 < M:
+                sat_sat_adj[s1, s2]  = 1.0
+                sat_sat_dist[s1, s2] = link_info["distance"] / 1e4   # km → 归一化
+                sat_sat_rate[s1, s2] = link_info["data_rate"] / 1e9   # bit/s → Gbps
 
         # ============================================================
         # 5. 实际任务数 (归一化)
@@ -237,8 +260,8 @@ class SatelliteGNNEnv(SatelliteSingleAgentEnv):
             "task_sat_adj":  task_sat_adj,
             "task_sat_dist": task_sat_dist,
             "task_sat_rate": task_sat_rate,
-            # "sat_sat_adj":   sat_sat_adj,
-            # "sat_sat_dist":  sat_sat_dist,
-            # "sat_sat_rate":  sat_sat_rate,
+            "sat_sat_adj":   sat_sat_adj,
+            "sat_sat_dist":  sat_sat_dist,
+            "sat_sat_rate":  sat_sat_rate,
             "num_tasks":     num_tasks,
         }

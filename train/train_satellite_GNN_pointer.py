@@ -1,24 +1,31 @@
 """
-MaskablePPO 训练脚本 —— 卫星网络任务卸载环境（支持并行环境加速）
-=================================================================
+MaskablePPO + PointerNet Actor + EGNN 训练脚本
+================================================
 
 功能：
-  1. 使用 MaskablePPO（带动作掩码的 PPO）训练 SatelliteSingleAgentEnv
-  2. 支持 SubprocVecEnv（多进程真并行）和 DummyVecEnv（单进程顺序执行）
-  3. 通过自定义 Callback 将环境指标写入 TensorBoard
-  4. 使用 MaskableEvalCallback 定期评估并保存最佳模型
+  1. 使用 MaskablePPO + PointerNetMaskablePolicy + GNNFeaturesExtractor(EGNN)
+     训练 SatelliteGNNEnv
+  2. Actor 采用 Pointer Network 结构，直接利用 GNN 缓存的结构化节点嵌入，
+     为每个 (task, sat) 对拼接 [task_h, task_feat, sat_h, sat_feat, dist, rate] 打分
+  3. Critic 接收 GNN fusion 输出的全局 flat 向量，经 MLP 估计 V(s)
+  4. 支持 SubprocVecEnv / DummyVecEnv 并行加速
+  5. 通过自定义 Callback 将环境指标写入 TensorBoard
+  6. 使用 MaskableEvalCallback 定期评估并保存最佳模型
 
-并行加速原理：
-  - PPO 的 collect_rollouts 阶段需要与环境交互 n_steps 步
-  - 使用 n_envs 个并行环境后，每一步同时收集 n_envs 条 transition
-  - rollout buffer 大小变为 n_steps × n_envs，有效加速数据收集
-  - 策略更新阶段（train）不受影响，仍在单 GPU/CPU 上执行
+与 train_satellite_GNN.py 的区别：
+  - 使用 PointerNetMaskablePolicy 代替 "MultiInputPolicy"
+  - Actor 由 Pointer Network 替代 MLP，天然感知每颗卫星的个体差异
+  - 使用 gnn_encoder_egnn2.py (双边特征 EGNN) 代替 gnn_encoder_egnn.py
+  - net_arch 中 pi=[] (Actor 不走 MlpExtractor)
 
 运行：
-  cd train && python train_satellite.py
+  cd train && python train_satellite_GNN_pointer.py
+
+指定 GPU 训练（例如使用第 0 号 GPU）：
+  CUDA_VISIBLE_DEVICES=0 python train_satellite_GNN_pointer.py
 
 TensorBoard 可视化：
-  tensorboard --logdir=./train/satellite_maskppo_logs/
+  tensorboard --logdir=./satellite_maskppo_logs/
 """
 
 from __future__ import annotations
@@ -30,33 +37,43 @@ from pathlib import Path
 
 import numpy as np
 
-# ── 确保 environment 包可导入 ──────────────────────────────────
+# ── 确保 environment 和 train 包可导入 ─────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR / "environment"))
-# SubprocVecEnv 子进程也需要能 import，将路径加到环境变量
-os.environ["PYTHONPATH"] = str(ROOT_DIR / "environment") + os.pathsep + os.environ.get("PYTHONPATH", "")
+sys.path.insert(0, str(ROOT_DIR / "train"))
+sys.path.insert(0, str(ROOT_DIR))
+os.environ["PYTHONPATH"] = (
+    str(ROOT_DIR / "environment") + os.pathsep
+    + str(ROOT_DIR / "train") + os.pathsep
+    + str(ROOT_DIR) + os.pathsep
+    + os.environ.get("PYTHONPATH", "")
+)
 
-from environment.satellite_single_agent_env import SatelliteSingleAgentEnv
+from environment.satellite_env_gnn import SatelliteGNNEnv
+from train.gnn_encoder_egnn2 import GNNFeaturesExtractor
+from sb3_contrib.common.maskable.policies_v2 import PointerNetMaskablePolicyV2_Attention
 
 from sb3_contrib import MaskablePPO
-from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from sb3_contrib.common.maskable.evaluation import evaluate_policy
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, sync_envs_normalization
+from stable_baselines3.common.vec_env import (
+    SubprocVecEnv,
+    DummyVecEnv,
+    VecNormalize,
+    sync_envs_normalization,
+)
 
 
 # =====================================================================
-# 1. 自定义 Callback —— 评估环境：记录环境指标到 TensorBoard（多环境适配）
+# 1. 自定义 Callback —— 评估环境：记录环境指标到 TensorBoard
 # =====================================================================
 class SatelliteEvalCallback(MaskableEvalCallback):
     """
     扩展 MaskableEvalCallback，在评估时额外记录
     eval/avg_delay_per_task 和 eval/avg_energy_per_task。
-    通过 evaluate_policy 的 callback 参数在每个评估 step 收集 info 指标，
-    episode 结束时按任务数加权计算每任务平均延迟/能耗。
     """
 
     def __init__(self, *args, **kwargs):
@@ -68,7 +85,6 @@ class SatelliteEvalCallback(MaskableEvalCallback):
         self._cur_tasks: dict[int, int] = {}
 
     def _collect_eval_metrics(self, locals_dict, globals_dict):
-        """在 evaluate_policy 每个 step 后被调用，积累指标。"""
         self._log_success_callback(locals_dict, globals_dict)
 
         info = locals_dict["info"]
@@ -184,7 +200,7 @@ class SatelliteEvalCallback(MaskableEvalCallback):
                     print("New best mean reward!")
                 if self.best_model_save_path is not None:
                     self.model.save(
-                        os.path.join(self.best_model_save_path, "best_model_20usesr")
+                        os.path.join(self.best_model_save_path, "best_model")
                     )
                 self.best_mean_reward = float(mean_reward)
                 if self.callback_on_new_best is not None:
@@ -194,25 +210,17 @@ class SatelliteEvalCallback(MaskableEvalCallback):
                 continue_training = continue_training and self._on_event()
 
         return continue_training
+
+
 # =====================================================================
-# 1. 自定义 Callback —— 记录环境特有指标到 TensorBoard（多环境适配）
+# 1-b. 自定义 Callback —— 训练环境：记录环境指标到 TensorBoard
 # =====================================================================
 class SatelliteMetricsCallback(BaseCallback):
-    """
-    适配多并行环境的指标记录回调。
-    
-    在 VecEnv 模式下：
-      - infos 是长度为 n_envs 的列表，每个元素是一个 dict
-      - rewards 是 shape (n_envs,) 的数组
-      - dones 是 shape (n_envs,) 的数组
-    
-    策略：对所有环境的指标取平均值记录，episode 结束时逐环境追踪。
-    """
+    """适配多并行环境的指标记录回调。"""
 
     def __init__(self, n_envs: int = 1, verbose: int = 0):
         super().__init__(verbose)
         self.n_envs = n_envs
-        # 每个环境独立追踪 episode 累计
         self._episode_rewards = [0.0] * n_envs
         self._episode_lengths = [0] * n_envs
         self._episode_count = 0
@@ -222,7 +230,6 @@ class SatelliteMetricsCallback(BaseCallback):
         rewards = self.locals.get("rewards", np.zeros(self.n_envs))
         dones = self.locals.get("dones", np.zeros(self.n_envs, dtype=bool))
 
-        # ── 聚合所有环境的逐步指标 ──
         delays = [info.get("total_delay", 0.0) for info in infos]
         energies = [info.get("total_energy", 0.0) for info in infos]
         overflows = [info.get("overflow_count", 0) for info in infos]
@@ -236,21 +243,25 @@ class SatelliteMetricsCallback(BaseCallback):
 
         total_tasks = sum(num_tasks_list)
         if total_tasks > 0:
-            self.logger.record("env/avg_delay_per_task",
-                               sum(delays) / total_tasks)
-            self.logger.record("env/avg_energy_per_task",
-                               sum(energies) / total_tasks)
+            self.logger.record(
+                "env/avg_delay_per_task", sum(delays) / total_tasks
+            )
+            self.logger.record(
+                "env/avg_energy_per_task", sum(energies) / total_tasks
+            )
 
-        # ── 逐环境追踪 episode ──
         for i in range(self.n_envs):
             self._episode_rewards[i] += float(rewards[i])
             self._episode_lengths[i] += 1
 
             if dones[i]:
                 self._episode_count += 1
-                self.logger.record("env/episode_reward", self._episode_rewards[i])
-                self.logger.record("env/episode_length", self._episode_lengths[i])
-                self.logger.record("env/episode_count", self._episode_count)
+                self.logger.record("env/episode_reward",
+                                   self._episode_rewards[i])
+                self.logger.record("env/episode_length",
+                                   self._episode_lengths[i])
+                self.logger.record("env/episode_count",
+                                   self._episode_count)
                 if self.verbose >= 1:
                     print(f"[Episode {self._episode_count}] env#{i} "
                           f"reward={self._episode_rewards[i]:.2f}, "
@@ -264,15 +275,16 @@ class SatelliteMetricsCallback(BaseCallback):
 # =====================================================================
 # 2. 环境工厂函数
 # =====================================================================
-def make_single_env(num_satellites: int = 4,
-                    num_users: int = 10,
-                    lambda0: float = 0.5,
-                    I_max: int | None = None,
-                    max_steps: int = 100,
-                    env_update_interval: int = 5,
-                    verbose: bool = True) -> SatelliteSingleAgentEnv:
-    """创建单个环境实例（用于非并行场景和推理演示）。"""
-    return SatelliteSingleAgentEnv(
+def make_gnn_env(
+    num_satellites: int = 4,
+    num_users: int = 10,
+    lambda0: float = 0.5,
+    I_max: int | None = None,
+    max_steps: int = 100,
+    env_update_interval: int = 5,
+    verbose: bool = True,
+) -> SatelliteGNNEnv:
+    return SatelliteGNNEnv(
         num_satellites=num_satellites,
         num_users=num_users,
         lambda0=lambda0,
@@ -283,29 +295,15 @@ def make_single_env(num_satellites: int = 4,
     )
 
 
-def make_parallel_envs(
+def make_parallel_gnn_envs(
     n_envs: int,
     vec_env_cls: type = SubprocVecEnv,
     seed: int = 42,
     **env_kwargs,
 ):
-    """
-    创建并行向量化环境。
-
-    Args:
-        n_envs: 并行环境数量
-        vec_env_cls: SubprocVecEnv（多进程）或 DummyVecEnv（单进程）
-        seed: 随机种子基数，每个环境 seed = base + i
-        **env_kwargs: 传递给 SatelliteSingleAgentEnv 的参数
-
-    Returns:
-        VecEnv 实例
-    """
-    # 训练时关闭环境内部打印
     env_kwargs.setdefault("verbose", False)
-
     vec_env = make_vec_env(
-        env_id=SatelliteSingleAgentEnv,
+        env_id=SatelliteGNNEnv,
         n_envs=n_envs,
         seed=seed,
         env_kwargs=env_kwargs,
@@ -327,9 +325,17 @@ def train(
     env_update_interval: int = 5,
     # ── 并行参数 ──
     n_envs: int = 4,
-    vec_env_cls: str = "subproc",  # "subproc" 或 "dummy"
+    vec_env_cls: str = "subproc",
+    # ── GNN 参数 ──
+    gnn_features_dim: int = 128,
+    gnn_hidden_dim: int = 64,
+    gnn_num_layers: int = 2,
+    gnn_num_heads: int = 4,
+    gnn_dropout: float = 0.0,
+    # ── Pointer scorer 参数 ──
+    score_hidden: int = 64,
     # ── 训练参数 ──
-    total_timesteps: int = 200_000,
+    total_timesteps: int = 600_000,
     n_steps: int = 256,
     batch_size: int = 64,
     n_epochs: int = 10,
@@ -342,31 +348,27 @@ def train(
     max_grad_norm: float = 0.5,
     target_kl: float | None = None,
     # ── 评估参数 ──
-    eval_freq: int = 5_000,
+    eval_freq: int = 6_000,
     n_eval_episodes: int = 5,
     # ── 日志 / 保存 ──
     log_dir: str = "./satellite_maskppo_logs/",
-    save_dir: str = "./satellite_maskppo_models/",
+    save_dir: str = "./satellite_maskppo_models_pointer/",
     seed: int = 42,
     verbose: int = 1,
+    # ── 设备 ──
+    device: str | None = "auto",
 ):
     """
-    完整训练流程（支持并行环境加速）：
-      1. 创建并行训练环境 & 单独评估环境
-      2. 构建 MaskablePPO 模型
+    完整训练流程（MaskablePPO + PointerNet Actor + EGNN 特征提取）：
+      1. 创建并行训练环境 (SatelliteGNNEnv) & 评估环境
+      2. 构建 MaskablePPO (PointerNetMaskablePolicy + GNNFeaturesExtractor)
       3. 挂载自定义回调 + 评估回调
       4. 训练
       5. 保存最终模型
-
-    关键并行参数关系：
-      rollout_buffer_size = n_steps × n_envs
-      每次策略更新使用的数据量 = n_steps × n_envs × n_epochs
-      总迭代轮数 ≈ total_timesteps / (n_steps × n_envs)
     """
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(save_dir, exist_ok=True)
 
-    # ── 选择向量化方式 ──
     VecEnvCls = SubprocVecEnv if vec_env_cls == "subproc" else DummyVecEnv
 
     env_kwargs = dict(
@@ -380,37 +382,73 @@ def train(
 
     # ── 创建并行训练环境 ──
     print("=" * 60)
-    print(f"  创建训练环境: {n_envs} 个并行 ({VecEnvCls.__name__})")
+    print(f"  创建 GNN 训练环境: {n_envs} 个并行 ({VecEnvCls.__name__})")
     print("=" * 60)
-    train_env = make_parallel_envs(
+    train_env = make_parallel_gnn_envs(
         n_envs=n_envs,
         vec_env_cls=VecEnvCls,
         seed=seed,
         **env_kwargs,
     )
 
-    # ── 创建评估环境（单独 1 个，方便 MaskableEvalCallback） ──
-    eval_env = make_parallel_envs(
+    # ── 创建评估环境 ──
+    eval_env = make_parallel_gnn_envs(
         n_envs=1,
-        vec_env_cls=DummyVecEnv,  # 评估用单进程即可
+        vec_env_cls=DummyVecEnv,
         seed=seed + 10000,
         **env_kwargs,
     )
 
+    # # 训练/评估环境使用一致的 VecNormalize 包装，避免评估同步统计量时报 wrapper mismatch。
+    # train_env = VecNormalize(
+    #     train_env,
+    #     training=True,
+    #     norm_obs=True,
+    #     norm_reward=True,
+    #     clip_obs=10.0,
+    # )
+    # eval_env = VecNormalize(
+    #     eval_env,
+    #     training=False,
+    #     norm_obs=True,
+    #     norm_reward=False,
+    #     clip_obs=10.0,
+    # )
+
     # ── 打印信息 ──
     print(f"\n  动作空间: {train_env.action_space}")
-    print(f"  观测空间: {train_env.observation_space}")
+    print(f"  观测空间 (Dict):")
+    obs_space = train_env.observation_space
+    for key in obs_space.spaces:
+        print(f"    {key}: {obs_space[key].shape}")
     print(f"  并行环境数: {n_envs}")
-    print(f"  每次 rollout 收集: n_steps={n_steps} × n_envs={n_envs} = {n_steps * n_envs} transitions")
-    print(f"  总迭代轮数 ≈ {total_timesteps} / ({n_steps}×{n_envs}) = {total_timesteps // (n_steps * n_envs)}")
+    print(f"  每次 rollout: n_steps={n_steps} × n_envs={n_envs}"
+          f" = {n_steps * n_envs} transitions")
 
-    # ── 构建模型 ──
+    # ── 构建 MaskablePPO + PointerNet ──
     print("\n" + "=" * 60)
-    print("  构建 MaskablePPO 模型")
+    print("  构建 MaskablePPO + PointerNetMaskablePolicy + EGNN")
     print("=" * 60)
 
+    policy_kwargs = dict(
+        features_extractor_class=GNNFeaturesExtractor,
+        features_extractor_kwargs=dict(
+            features_dim=gnn_features_dim,
+            hidden_dim=gnn_hidden_dim,
+            num_gnn_layers=gnn_num_layers,
+            num_heads=gnn_num_heads,
+            edge_dim=1,
+            dropout=gnn_dropout,
+        ),
+        share_features_extractor=False,
+        # Actor 由 PointerScorer 替代，pi 分支不走 MlpExtractor
+        net_arch=dict(pi=[], vf=[]),
+        score_hidden=score_hidden,
+        critic_hidden=256,
+    )
+
     model = MaskablePPO(
-        policy=MaskableActorCriticPolicy,
+        policy=PointerNetMaskablePolicyV2_Attention,
         env=train_env,
         learning_rate=learning_rate,
         n_steps=n_steps,
@@ -423,25 +461,49 @@ def train(
         vf_coef=vf_coef,
         max_grad_norm=max_grad_norm,
         target_kl=target_kl,
+        policy_kwargs=policy_kwargs,
         tensorboard_log=log_dir,
         verbose=verbose,
         seed=seed,
+        device=device,
     )
 
-    print(f"  策略网络: {model.policy}")
+    print(f"  策略网络: {model.policy.__class__.__name__}")
+    print(f"  Actor: PointerScorerV2 (score_hidden={score_hidden})")
+    print(f"  Critic: StructuredCritic (critic_hidden={policy_kwargs.get('critic_hidden', 256)})")
+    print(f"  pi_features_extractor: {model.policy.pi_features_extractor.__class__.__name__}")
+    print(f"  vf_features_extractor: {model.policy.vf_features_extractor.__class__.__name__}")
+    print(f"  GNN 参数: features_dim={gnn_features_dim}, "
+          f"hidden_dim={gnn_hidden_dim}, "
+          f"layers={gnn_num_layers}, heads={gnn_num_heads}")
     print(f"  设备: {model.device}")
 
-    # ── 回调 ──
-    metrics_callback = SatelliteMetricsCallback(n_envs=n_envs, verbose=verbose)
+    total_params = sum(p.numel() for p in model.policy.parameters())
+    trainable_params = sum(
+        p.numel() for p in model.policy.parameters() if p.requires_grad
+    )
+    print(f"  总参数量: {total_params:,}")
+    print(f"  可训练参数量: {trainable_params:,}")
 
-    # eval_freq 是以 collect_rollouts 的 step 为单位的 (每步所有 n_envs 同时走一步)
-    # 为了保证约每 eval_freq 个 timestep 评估一次，需除以 n_envs
+    # ── 打印 Actor / Critic 参数量 ──
+    pi_ext_params = sum(p.numel() for p in model.policy.pi_features_extractor.parameters())
+    vf_ext_params = sum(p.numel() for p in model.policy.vf_features_extractor.parameters())
+    scorer_params = sum(p.numel() for p in model.policy.pointer_scorer.parameters())
+    critic_params = sum(p.numel() for p in model.policy.structured_critic.parameters())
+    print(f"  [Actor]  pi_extractor={pi_ext_params:,}, pointer_scorer={scorer_params:,}")
+    print(f"  [Critic] vf_extractor={vf_ext_params:,}, structured_critic={critic_params:,}")
+
+    # ── 回调 ──
+    metrics_callback = SatelliteMetricsCallback(
+        n_envs=n_envs, verbose=verbose
+    )
+
     adjusted_eval_freq = max(eval_freq // n_envs, 1)
 
     eval_callback = SatelliteEvalCallback(
         eval_env,
         best_model_save_path=save_dir,
-        log_path=os.path.join(log_dir, "eval_results"),
+        log_path=os.path.join(log_dir, "eval_results_pointer"),
         eval_freq=adjusted_eval_freq,
         n_eval_episodes=n_eval_episodes,
         deterministic=True,
@@ -454,6 +516,7 @@ def train(
     # ── 训练 ──
     print("\n" + "=" * 60)
     print(f"  开始训练 (total_timesteps={total_timesteps}, n_envs={n_envs})")
+    print(f"  使用 PointerNet Actor + EGNN 特征提取器")
     print("=" * 60)
 
     t0 = time.time()
@@ -461,7 +524,7 @@ def train(
         total_timesteps=total_timesteps,
         callback=callback,
         log_interval=1,
-        tb_log_name="MaskablePPO_Satellite",
+        tb_log_name="MaskablePPO_Pointer_Satellite",
         use_masking=True,
     )
     elapsed = time.time() - t0
@@ -469,14 +532,21 @@ def train(
     print(f"  等效速度: {total_timesteps / elapsed:.0f} timesteps/s")
 
     # ── 保存最终模型 ──
-    final_path = os.path.join(save_dir, "final_model")
+    final_path = os.path.join(save_dir, "final_model_pointer")
     model.save(final_path)
     print(f"  最终模型已保存到: {final_path}")
+    # ── 保存 VecNormalize 统计量（obs/reward 的运行均值方差）──
+    if isinstance(train_env, VecNormalize):
+        vecnorm_path = os.path.join(save_dir, "vecnormalize.pkl")
+        train_env.save(vecnorm_path)
+        print(f"  VecNormalize 统计量已保存到: {vecnorm_path}")
 
     # ── 最终评估 ──
     print("\n" + "=" * 60)
     print("  最终评估")
     print("=" * 60)
+    if isinstance(train_env, VecNormalize) and isinstance(eval_env, VecNormalize):
+        sync_envs_normalization(train_env, eval_env)
     mean_reward, std_reward = evaluate_policy(
         model, eval_env,
         n_eval_episodes=20,
@@ -497,9 +567,8 @@ def train(
 # 4. 推理演示
 # =====================================================================
 def demo_inference(model_path: str, num_episodes: int = 3, **env_kwargs):
-    """加载训练好的模型，进行推理演示（单环境，带详细打印）。"""
-    env_kwargs.setdefault("verbose", True)  # 推理时开启详细打印
-    env = make_single_env(**env_kwargs)
+    env_kwargs.setdefault("verbose", True)
+    env = make_gnn_env(**env_kwargs)
 
     model = MaskablePPO.load(model_path)
 
@@ -511,13 +580,15 @@ def demo_inference(model_path: str, num_episodes: int = 3, **env_kwargs):
 
         while not done:
             masks = get_action_masks(env)
-            action, _ = model.predict(obs, action_masks=masks, deterministic=True)
+            action, _ = model.predict(obs, action_masks=masks,
+                                      deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
             step += 1
             done = terminated or truncated
 
-        print(f"[Demo Episode {ep + 1}] steps={step}, reward={total_reward:.4f}")
+        print(f"[Demo Episode {ep + 1}] steps={step}, "
+              f"reward={total_reward:.4f}")
 
     env.close()
 
@@ -529,32 +600,40 @@ if __name__ == "__main__":
     trained_model = train(
         # ── 环境 ──
         num_satellites=4,
-        num_users=10, #10,20
-        lambda0=0.3, # 0.3,0.25
-        I_max=6, #6,
+        num_users=10,
+        lambda0=0.3,
+        I_max=6,
         max_steps=60,
         env_update_interval=5,
         # ── 并行 ──
-        n_envs=4,                # 4 个并行环境，数据收集加速约 4 倍
-        vec_env_cls="subproc",   # "subproc"=多进程真并行, "dummy"=单进程顺序
+        n_envs=4,
+        vec_env_cls="subproc",
+        # ── GNN ──
+        gnn_features_dim=128,
+        gnn_hidden_dim=64,
+        gnn_num_layers=1,
+        gnn_num_heads=4,
+        gnn_dropout=0.0,
+        # ── Pointer scorer ──
+        score_hidden=64,
         # ── 训练 ──
-        total_timesteps=1000_000,
-        n_steps=1024,             # 256,512 每个环境收集 256 步，总 buffer = 256×4 = 1024
-        batch_size=256,         #64, 128
-        n_epochs=5,             # 对同一批 rollout 数据重复训练几轮 10
-        learning_rate=3e-4,     #3e-4
+        total_timesteps=1_000_000,
+        n_steps=1024,
+        batch_size=128,
+        n_epochs=5,
+        learning_rate=3e-4,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
         ent_coef=0.02,
         target_kl=0.03,
         # ── 评估 ──
-        eval_freq=10_000,         # 约每 5000 个 timestep 评估一次
+        eval_freq=20_000,
         n_eval_episodes=5,
         # ── 日志 ──
         log_dir="./satellite_maskppo_logs/",
-        save_dir="./satellite_maskppo_models/",
+        save_dir="./satellite_maskppo_models_pointer/",
         seed=42,
         verbose=1,
-
+        device="cpu",
     )

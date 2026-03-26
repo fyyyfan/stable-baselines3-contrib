@@ -135,6 +135,146 @@ def sample_masked_action(env: SatelliteSingleAgentEnv, mask_matrix: np.ndarray) 
     return action
 
 
+def evaluate_valid_actions_costs(
+    env: SatelliteSingleAgentEnv,
+    mask_matrix: np.ndarray,
+    max_tasks_to_show: int = 3,
+    top_k: int = 5,
+):
+    """
+    在**不改变真实环境策略与状态**的前提下，遍历动作掩码得到的有效动作，
+    计算每个动作对应的 (delay, energy, overflow) 以便对比优劣。
+
+    说明:
+    - **显式复用** `world` 里的纯计算函数，
+      手动实现与 `_execute_offload` 等价的 delay/energy/overflow 计算，
+      并避免对队列等状态产生任何修改。
+    - 环境真实步进仍在外层按原随机策略 `env.step(action)` 执行，不受本函数影响。
+    """
+    num_tasks = min(len(env.current_task_pool), env.I_max)
+    num_tasks_to_show = min(num_tasks, max_tasks_to_show)
+    if num_tasks_to_show <= 0:
+        print("\n[动作评估] 当前无真实任务，跳过评估。")
+        return
+
+    print("\n[动作评估] 遍历有效动作并计算 delay/energy (不影响真实 step)")
+    for i in range(num_tasks_to_show):
+        device, task = env.current_task_pool[i]
+        valid_actions = np.where(mask_matrix[i])[0].tolist()
+        if len(valid_actions) == 0:
+            print(f"  - 任务{i} (设备{device.id}): 无有效动作")
+            continue
+
+        results = []
+        base_d = 0
+        base_e = 0
+        for a in valid_actions:
+            try:
+                w = env.world
+                assert w is not None
+                M = env.num_satellites
+
+                # ---------- 本地执行 ----------
+                if a == 0:
+                    delay = w.compute_local_delay(device, task)
+                    energy = w.compute_local_energy(device, task)
+                    overflow = delay > task.delay_requirement
+
+                    base_d = delay
+                    base_e = energy
+
+                # ---------- 卸载到卫星 ----------
+                elif 1 <= a <= M:
+                    sat_idx = a - 1
+                    sat = w.satellites[sat_idx]
+
+                    # 暂时绑定当前服务卫星，仅用于延迟/能耗计算（不入队）
+                    original_sat = device.current_sat
+                    device.current_sat = sat
+                    try:
+                        delay = w.compute_edge_delay(device, task, sat)
+                        energy = w.compute_edge_energy(device, task, sat)
+                    finally:
+                        # 恢复原来的 current_sat
+                        device.current_sat = original_sat
+
+                    # 队列溢出判定：使用当前 queue_backlog + 本任务 cycles 与 buffer_capacity 对比
+                    arrival_cycles = task.total_cpu_cycles()
+                    overflow_queue = (sat.queue_backlog + arrival_cycles > sat.buffer_capacity)
+                    overflow_deadline = delay > task.delay_requirement
+                    overflow = overflow_queue or overflow_deadline
+
+                # ---------- 卸载到云端 ----------
+                else:
+                    # 记录原来的 current_sat
+                    original_sat = device.current_sat
+                    # 为云端计算更新最近卫星
+                    best_sat = w._update_device_current_sat(device)
+                    try:
+                        if w.cloud_server is not None and best_sat is not None and w.cloud_server.current_sat is not None:
+                            delay = w.compute_cloud_total_delay(device, task, w.cloud_server)
+                            energy = w.compute_cloud_energy(device, task, w.cloud_server)
+                        else:
+                            delay = float("inf")
+                            energy = float("inf")
+                    finally:
+                        # 恢复 device.current_sat
+                        device.current_sat = original_sat
+
+                    overflow = delay > task.delay_requirement
+
+                # reward = - (1 * delay/base_d + 1 * energy/base_e)
+                # 计算相对于本地执行的节省比例 (节省为正，恶化为负)
+                if base_d > 0 and base_e > 0:
+                    delay_improvement = (base_d - delay) / base_d
+                    energy_improvement = (base_e - energy) / base_e
+                    # 这里可以调整权重，比如时间更重要就 1.0，能耗次要就 0.6
+                    reward = 1.5 * delay_improvement + 0.5 * energy_improvement
+
+                results.append(
+                    {
+                        "action": int(a),
+                        "delay": float(delay),
+                        "energy": float(energy),
+                        "overflow": bool(overflow),
+                        "reward": float(reward),
+                    }
+                )
+            except Exception as e:
+                results.append(
+                    {
+                        "action": int(a),
+                        "delay": float("inf"),
+                        "energy": float("inf"),
+                        "overflow": True,
+                        "reward": float("inf"),
+                        "error": str(e),
+                    }
+                )
+
+        # 排序：
+        results.sort(key=lambda r: (r.get("reward", float("inf")), r.get("delay", float("inf")), r.get("energy", float("inf"))))
+
+        print(f"\n  任务{i} (设备{device.id}) 有效动作数={len(valid_actions)}，展示Top-{min(top_k, len(results))}:")
+        for rank, r in enumerate(results[:top_k], start=1):
+            a = r["action"]
+            if a == 0:
+                target_desc = "本地"
+            elif 1 <= a <= env.num_satellites:
+                target_desc = f"卫星{a}"
+            else:
+                target_desc = "云端"
+
+            extra = ""
+            if "error" in r:
+                extra = f" | error={r['error']}"
+
+            print(
+                f"    #{rank:<2d} action={a:<3d} ({target_desc:<4}) "
+                f"delay={r['delay']:.6f}s energy={r['energy']:.3e}J reward={r['reward']:.3f}{extra}"
+            )
+
+
 def print_action_decision(env: SatelliteSingleAgentEnv, action: np.ndarray):
     """打印动作决策的详细信息"""
     num_tasks = min(len(env.current_task_pool), env.I_max)
@@ -276,15 +416,19 @@ def test_env_step(env: SatelliteSingleAgentEnv, num_steps: int = 10):
         
         # 3. 获取并打印动作掩码
         mask_matrix = print_action_masks(env)
+
+        # 3.1 旁路评估：遍历有效动作并比较 delay/energy（不影响真实随机策略）
+        evaluate_valid_actions_costs(env, mask_matrix, max_tasks_to_show=6, top_k=5)
         
         # 4. 基于掩码采样动作（随机策略）
-        action = sample_masked_action(env, mask_matrix)
+        # action = sample_masked_action(env, mask_matrix)
+        action = [5,5,5,5,5,5]
         
         # 5. 打印卸载决策
         # print_action_decision(env, action)
         
-        # 绘制图像
-        env.world.plot_step_positions_interactive(step)
+        # # 绘制图像
+        # env.world.plot_step_positions_interactive(step)
 
         # 6. 执行 step
         print(f"\n[执行 step]...")
@@ -485,7 +629,7 @@ def main():
     
     # 测试3: 单步执行（详细打印）
     # env.reset(seed=42)  # 重置环境
-    test_env_step(env, num_steps=5)
+    test_env_step(env, num_steps=3)
 
     
     # # 测试4: 动作空间有效性

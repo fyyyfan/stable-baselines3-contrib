@@ -354,7 +354,7 @@ class SatelliteSingleAgentEnv(gym.Env):
             sat_tran_power=np.random.randint(5, 15, self.num_satellites),#[10] * self.num_satellites,
             sat_tran_gain=np.random.randint(30, 45, self.num_satellites),#[36] * self.num_satellites,
             sat_rec_gain=np.random.randint(36, 51, self.num_satellites),#[41] * self.num_satellites,
-            sat_comp_resource=np.random.randint(2, 8, self.num_satellites),#[5]*self.num_satellites,
+            sat_comp_resource=np.random.randint(2, 8, self.num_satellites),#[5]*self.num_satellites,(5,10)
             sat_kappa_sat=[1e-28]*self.num_satellites,
             sat_buffer_capacity=[10] * self.num_satellites,#.random.randint(200, 400, self.num_satellites),
         )
@@ -454,9 +454,19 @@ class SatelliteSingleAgentEnv(gym.Env):
             device, task = self.current_task_pool[i]
             target = decisions[i]  # 0=本地, 1..M=卫星, M+1=云
 
-            delay_i, energy_i, overflow_i = self._execute_offload(
-                device, task, target, w
-            )
+            # 基准值：本地执行（target == 0）的延迟和能耗
+            base_delay = w.compute_local_delay(device, task)
+            base_energy = w.compute_local_energy(device, task)
+
+            if target == 0:
+                delay_i = base_delay
+                energy_i = base_energy
+                overflow_i = False
+            else:
+                delay_i, energy_i, overflow_i = self._execute_offload(
+                    device, task, target, w
+                )
+            
             if self.verbose:
                 print(f"【任务{i}】延迟: {delay_i:.2f}s, 能耗: {energy_i:.2f}J, 是否溢出: {overflow_i}")
             # TODO:奖励计算待修改
@@ -467,17 +477,36 @@ class SatelliteSingleAgentEnv(gym.Env):
             # delay_norm = self._normalize_cost(delay_i, self.delay_min, self.delay_max)
             # energy_norm = self._normalize_cost(energy_i, self.energy_min, self.energy_max)
 
+            # 原任务成本计算（按绝对延迟和能耗）
             # task_cost = (self.delay_weight * delay_norm
             #              + self.energy_weight * energy_norm)
-            task_cost = 1 * delay_i + 0.5 * energy_i
+            # task_cost = 1 * delay_i + 0.5 * energy_i
+
+            # # 新任务成本计算：相对本地执行的归一化代价
+            # if base_delay > 0 and base_energy > 0:
+            #     task_cost = 1 * delay_i / base_delay + 0.6 * energy_i / base_energy
+            # else:
+            #     # 退化情况：本地延迟或能耗为 0 时，退回到未归一化形式
+            #     task_cost = 1 * delay_i + 1 * energy_i
+            
+            # 计算相对于本地执行的节省比例 (节省为正，恶化为负)
+            if base_delay > 0 and base_energy > 0:
+                delay_improvement = (base_delay - delay_i) / base_delay
+                energy_improvement = (base_energy - energy_i) / base_energy
+                # 这里可以调整权重，比如时间更重要就 1.0，能耗次要就 0.6
+                task_cost = 1.0 * delay_improvement + 1.0 * energy_improvement
+            else:
+                # 退化情况
+                task_cost = - (1 * delay_i + 1 * energy_i)
+
             if self.verbose:
                 print(f"任务{i}归一化奖励: {task_cost:.2f}")
 
             if overflow_i:
                 task_cost += self.overflow_penalty
                 overflow_count += 1
-            # 将每个任务归一化后的奖励累计到 total_reward，整体为负值
-            total_reward -= task_cost
+            # 将每个任务归一化后的奖励累计到 total_reward
+            total_reward += task_cost
 
         # ===========消耗卫星节点队列中的任务，通过消耗 w.dt 计算量，任务完成后更新 service_users）
         for sat in w.satellites[: self.num_satellites]:
