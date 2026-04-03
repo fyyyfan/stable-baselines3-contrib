@@ -51,7 +51,7 @@ os.environ["PYTHONPATH"] = (
 
 from environment.satellite_env_gnn import SatelliteGNNEnv
 from train.gnn_encoder_egnn2 import GNNFeaturesExtractor
-from sb3_contrib.common.maskable.policies_v2 import PointerNetMaskablePolicyV2_Attention
+from sb3_contrib.common.maskable.policies_v1 import PointerNetMaskablePolicy
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.evaluation import evaluate_policy
@@ -200,7 +200,7 @@ class SatelliteEvalCallback(MaskableEvalCallback):
                     print("New best mean reward!")
                 if self.best_model_save_path is not None:
                     self.model.save(
-                        os.path.join(self.best_model_save_path, "best_model")
+                        os.path.join(self.best_model_save_path, "best_model33")
                     )
                 self.best_mean_reward = float(mean_reward)
                 if self.callback_on_new_best is not None:
@@ -292,6 +292,7 @@ def make_gnn_env(
         max_steps=max_steps,
         env_update_interval=env_update_interval,
         verbose=verbose,
+        enable_cloud_offload=False,
     )
 
 
@@ -339,7 +340,8 @@ def train(
     n_steps: int = 256,
     batch_size: int = 64,
     n_epochs: int = 10,
-    learning_rate: float = 3e-4,
+    actor_learning_rate: float = 3e-4,
+    critic_learning_rate: float = 3e-4,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     clip_range: float = 0.2,
@@ -440,7 +442,7 @@ def train(
             edge_dim=1,
             dropout=gnn_dropout,
         ),
-        share_features_extractor=False,
+        share_features_extractor=False, #设为共享参数
         # Actor 由 PointerScorer 替代，pi 分支不走 MlpExtractor
         net_arch=dict(pi=[], vf=[]),
         score_hidden=score_hidden,
@@ -448,9 +450,10 @@ def train(
     )
 
     model = MaskablePPO(
-        policy=PointerNetMaskablePolicyV2_Attention,
+        policy=PointerNetMaskablePolicy,
         env=train_env,
-        learning_rate=learning_rate,
+        actor_learning_rate=actor_learning_rate,
+        critic_learning_rate=critic_learning_rate,
         n_steps=n_steps,
         batch_size=batch_size,
         n_epochs=n_epochs,
@@ -489,9 +492,10 @@ def train(
     pi_ext_params = sum(p.numel() for p in model.policy.pi_features_extractor.parameters())
     vf_ext_params = sum(p.numel() for p in model.policy.vf_features_extractor.parameters())
     scorer_params = sum(p.numel() for p in model.policy.pointer_scorer.parameters())
-    critic_params = sum(p.numel() for p in model.policy.structured_critic.parameters())
+    critic_params = sum(p.numel() for p in model.policy.pooling_critic.parameters())
+    # critic_params = sum(p.numel() for p in model.policy.structured_critic.parameters()) #Policies_V2
     print(f"  [Actor]  pi_extractor={pi_ext_params:,}, pointer_scorer={scorer_params:,}")
-    print(f"  [Critic] vf_extractor={vf_ext_params:,}, structured_critic={critic_params:,}")
+    print(f"  [Critic] vf_extractor={vf_ext_params:,}, critic={critic_params:,}")
 
     # ── 回调 ──
     metrics_callback = SatelliteMetricsCallback(
@@ -532,7 +536,7 @@ def train(
     print(f"  等效速度: {total_timesteps / elapsed:.0f} timesteps/s")
 
     # ── 保存最终模型 ──
-    final_path = os.path.join(save_dir, "final_model_pointer")
+    final_path = os.path.join(save_dir, "final_model_pointer33")
     model.save(final_path)
     print(f"  最终模型已保存到: {final_path}")
     # ── 保存 VecNormalize 统计量（obs/reward 的运行均值方差）──
@@ -600,13 +604,13 @@ if __name__ == "__main__":
     trained_model = train(
         # ── 环境 ──
         num_satellites=4,
-        num_users=10,
-        lambda0=0.3,
-        I_max=6,
+        num_users=6, #10,
+        lambda0=0.3, #0.3,
+        I_max=6, #6,
         max_steps=60,
-        env_update_interval=5,
+        env_update_interval=10,
         # ── 并行 ──
-        n_envs=4,
+        n_envs=8,
         vec_env_cls="subproc",
         # ── GNN ──
         gnn_features_dim=128,
@@ -617,23 +621,24 @@ if __name__ == "__main__":
         # ── Pointer scorer ──
         score_hidden=64,
         # ── 训练 ──
-        total_timesteps=1_000_000,
-        n_steps=1024,
-        batch_size=128,
-        n_epochs=5,
-        learning_rate=3e-4,
+        total_timesteps=1_500_000, #2_000_000,
+        n_steps=1024, #1024
+        batch_size=256, #128
+        n_epochs=10,
+        actor_learning_rate=5e-4,
+        critic_learning_rate=1e-3,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.02,
+        ent_coef=0.03, #0.02
         target_kl=0.03,
         # ── 评估 ──
         eval_freq=20_000,
-        n_eval_episodes=5,
+        n_eval_episodes=4,
         # ── 日志 ──
         log_dir="./satellite_maskppo_logs/",
         save_dir="./satellite_maskppo_models_pointer/",
         seed=42,
         verbose=1,
-        device="cpu",
+        device="cuda:0",
     )

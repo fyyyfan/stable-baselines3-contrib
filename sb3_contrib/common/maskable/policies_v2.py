@@ -63,13 +63,20 @@ class PointerScorerV2(nn.Module):
     """
     纯节点特征的 Pointer Network 动作打分网络。
 
-    相比PointerScorer(policies_v1.py)的改动：
-    - 不使用边特征 (dist, rate) 作为打分输入
-    对每对 (task_i, sat_m) 拼接特征:
-      [task_h_i(D), task_features_i(d_task), sat_h_m(D), sat_features_m(d_sat)]
-    经 MLP 输出标量得分，最终 reshape 为 MultiDiscrete 所需的 logits。
+    动作索引定义（与环境 MultiDiscrete 一致）：
+      - 0:       本地执行（由 local_mlp 评估）
+      - 1..M:    卸载到卫星 0..M-1（由 offload_mlp 评估）
+      - M+1:     卸载到云端（由 offload_mlp 评估，云端为 sat_h 的第 M 个节点）
 
-    与 PointerScorer (policies_new.py) 的区别：不使用边特征 (dist, rate)。
+    本地动作打分：
+      对每个 task_i 拼接 [task_h_i, task_features_i]，经 local_mlp 输出标量得分。
+
+    卸载动作打分：
+      对每对 (task_i, sat_m) 拼接特征:
+        [task_h_i(D), task_features_i(d_task), sat_h_m(D), sat_features_m(d_sat)]
+      经 offload_mlp 输出标量得分。不使用边特征 (dist, rate)。
+
+    最终拼接顺序：[local_score, offload_scores]，reshape 为 (B, I_max * B_actions)。
     """
 
     def __init__(
@@ -88,18 +95,26 @@ class PointerScorerV2(nn.Module):
         self.B_actions = B_actions
         self.I_max = I_max
 
-        in_dim = 2 * hidden_dim + d_task + d_sat
-
-        self.score_mlp = nn.Sequential(
-            nn.Linear(in_dim, score_hidden),
+        # ── 本地执行打分: [task_h(D), task_feat(d_task)] → 标量 ──
+        local_in_dim = hidden_dim + d_task
+        self.local_mlp = nn.Sequential(
+            nn.Linear(local_in_dim, score_hidden),
             nn.ELU(),
             nn.Linear(score_hidden, 1, bias=False),
         )
 
-        self.extra_bias = nn.Parameter(th.zeros(B_actions))
+        # ── 卸载打分: [task_h(D), task_feat(d_task), sat_h(D), sat_feat(d_sat)] → 标量 ──
+        offload_in_dim = 2 * hidden_dim + d_task + d_sat
+        self.offload_mlp = nn.Sequential(
+            nn.Linear(offload_in_dim, score_hidden),
+            nn.ELU(),
+            nn.Linear(score_hidden, 1, bias=False),
+        )
 
-        nn.init.orthogonal_(self.score_mlp[0].weight, gain=np.sqrt(2))
-        nn.init.orthogonal_(self.score_mlp[2].weight, gain=0.01)
+        nn.init.orthogonal_(self.local_mlp[0].weight, gain=np.sqrt(2))
+        nn.init.orthogonal_(self.local_mlp[2].weight, gain=0.01)
+        nn.init.orthogonal_(self.offload_mlp[0].weight, gain=np.sqrt(2))
+        nn.init.orthogonal_(self.offload_mlp[2].weight, gain=0.01)
 
     def forward(
         self,
@@ -108,24 +123,34 @@ class PointerScorerV2(nn.Module):
         task_features: th.Tensor,   # (B, I, d_task)
         sat_features: th.Tensor,    # (B, M_sat, d_sat)
     ) -> th.Tensor:
-        """返回 logits, shape (B, I_max * B_actions)。"""
+        """
+        返回 logits, shape (B, I_max * B_actions)。
+
+        logits 按 [local(1), sat_0..sat_{M-1}(M), cloud(1)] 排列，
+        对应动作索引 [0, 1, ..., M, M+1]。
+        """
         B, I, D = task_h.shape
         M_sat = sat_h.shape[1]
-        extra = self.B_actions - M_sat
 
+        # ── 索引 0: 本地执行得分 ──
+        local_inp = th.cat([task_h, task_features], dim=-1)            # (B, I, D+d_task)
+        local_score = self.local_mlp(local_inp)                        # (B, I, 1)
+
+        # ── 索引 1..M_sat: 卸载到卫星/云端的得分 ──
         ti = task_h.unsqueeze(2).expand(B, I, M_sat, D)
         tf = task_features.unsqueeze(2).expand(B, I, M_sat, self.d_task)
         sj = sat_h.unsqueeze(1).expand(B, I, M_sat, D)
         sf = sat_features.unsqueeze(1).expand(B, I, M_sat, self.d_sat)
 
-        inp = th.cat([ti, tf, sj, sf], dim=-1)    # (B, I, M, 2D+d_task+d_sat)
-        scores_sat = self.score_mlp(inp).squeeze(-1)  # (B, I, M_sat)
+        offload_inp = th.cat([ti, tf, sj, sf], dim=-1)                # (B, I, M, 2D+d_task+d_sat)
+        offload_scores = self.offload_mlp(offload_inp).squeeze(-1)     # (B, I, M_sat)
 
-        if extra > 0:
-            extra_scores = self.extra_bias[:extra].view(1, 1, extra).expand(B, I, extra)
-            scores = th.cat([scores_sat, extra_scores], dim=-1)  # (B, I, B_actions)
-        else:
-            scores = scores_sat
+        # ── 拼接: [local(1), offload(M_sat)] = B_actions 列 ──
+        scores = th.cat([local_score, offload_scores], dim=-1)         # (B, I, 1+M_sat)
+
+        assert scores.shape[-1] == self.B_actions, (
+            f"scores dim {scores.shape[-1]} != B_actions {self.B_actions}"
+        )
 
         return scores.reshape(B, I * self.B_actions)
 
@@ -137,15 +162,22 @@ class PointerScorerV2_Attention(nn.Module):
     """
     基于 Query-Key 注意力的 Pointer Network 动作打分网络。
 
-    对任务 i 和卫星 j 分别拼接 [GNN 嵌入, 原始特征] 后做线性映射得到
-    Query (B, I, H) 和 Key (B, M, H)，通过缩放点积注意力生成基础打分，
-    再加上由成对边特征 (dist, rate) 线性投影得到的偏置项。
+    动作索引定义（与环境 MultiDiscrete 一致）：
+      - 0:       本地执行（由 local_mlp 评估）
+      - 1..M:    卸载到卫星 0..M-1（由 QK 注意力 + 边偏置评估）
+      - M+1:     卸载到云端（同上，云端为 sat_h 的第 M 个节点）
 
-    score(i, j) = Q_i · K_j^T / sqrt(H)  +  edge_proj([dist_ij, rate_ij])
+    本地动作打分：
+      对每个 task_i 拼接 [task_h_i, task_features_i]，经 local_mlp 输出标量得分。
 
-    相比 PointerScorerV2 (MLP 打分):
-      - 计算量从 O(I·M·(2D+d_task+d_sat)·H) 降低到 O((I+M)·(D+d)·H + I·M·H)
-      - 通过 edge_proj 引入边特征，使打分同时考虑拓扑关系
+    卸载动作打分：
+      对任务 i 和卫星 j 分别拼接 [GNN 嵌入, 原始特征] 后做线性映射得到
+      Query (B, I, H) 和 Key (B, M, H)，通过缩放点积注意力生成基础打分，
+      再加上由成对边特征 (dist, rate) 线性投影得到的偏置项。
+
+      score(i, j) = Q_i · K_j^T / sqrt(H)  +  edge_proj([dist_ij, rate_ij])
+
+    最终拼接顺序：[local_score, offload_scores]，reshape 为 (B, I_max * B_actions)。
     """
 
     def __init__(
@@ -165,18 +197,27 @@ class PointerScorerV2_Attention(nn.Module):
         self.I_max = I_max
         self.score_hidden = score_hidden
 
+        # ── 本地执行打分: [task_h(D), task_feat(d_task)] → 标量 ──
+        local_in_dim = hidden_dim + d_task
+        self.local_mlp = nn.Sequential(
+            nn.Linear(local_in_dim, score_hidden),
+            nn.ELU(),
+            nn.Linear(score_hidden, 1, bias=False),
+        )
+
+        # ── 卸载打分: QK 注意力 + 边偏置 ──
         self.query_norm = nn.LayerNorm(score_hidden)
         self.key_norm = nn.LayerNorm(score_hidden)
 
         self.query_proj = nn.Linear(hidden_dim + d_task, score_hidden)
         self.key_proj = nn.Linear(hidden_dim + d_sat, score_hidden)
         self.edge_proj = nn.Linear(2, 1, bias=False)
-        self.extra_bias = nn.Parameter(th.zeros(B_actions))
 
+        nn.init.orthogonal_(self.local_mlp[0].weight, gain=np.sqrt(2))
+        nn.init.orthogonal_(self.local_mlp[2].weight, gain=0.01)
         nn.init.orthogonal_(self.query_proj.weight, gain=np.sqrt(2))
         nn.init.orthogonal_(self.key_proj.weight, gain=np.sqrt(2))
         with th.no_grad():
-            # 轻微偏好 dist 小 / rate 大: w_dist < 0, w_rate > 0
             self.edge_proj.weight.copy_(th.tensor([[-0.1, 0.1]]))
 
     def forward(
@@ -188,19 +229,25 @@ class PointerScorerV2_Attention(nn.Module):
         edge_dist: th.Tensor,       # (B, I, M_sat)
         edge_rate: th.Tensor,       # (B, I, M_sat)
     ) -> th.Tensor:
-        """返回 logits, shape (B, I_max * B_actions)。"""
+        """
+        返回 logits, shape (B, I_max * B_actions)。
+
+        logits 按 [local(1), sat_0..sat_{M-1}(M), cloud(1)] 排列，
+        对应动作索引 [0, 1, ..., M, M+1]。
+        """
         B, I, D = task_h.shape
         M_sat = sat_h.shape[1]
-        extra = self.B_actions - M_sat
 
-        task_combined = th.cat([task_h, task_features], dim=-1)  # (B, I, D+d_task)
-        sat_combined = th.cat([sat_h, sat_features], dim=-1)    # (B, M, D+d_sat)
+        # ── 索引 0: 本地执行得分 ──
+        local_inp = th.cat([task_h, task_features], dim=-1)      # (B, I, D+d_task)
+        local_score = self.local_mlp(local_inp)                   # (B, I, 1)
 
-        queries = self.query_proj(task_combined)                 # (B, I, H)
-        keys = self.key_proj(sat_combined)                       # (B, M, H)
-        # TODO：是否需要LayerNorm？
-        # queries = self.query_norm(self.query_proj(task_combined))
-        # keys = self.key_norm(self.key_proj(sat_combined))
+        # ── 索引 1..M_sat: 卸载到卫星/云端的得分 (QK attention + edge bias) ──
+        task_combined = th.cat([task_h, task_features], dim=-1)   # (B, I, D+d_task)
+        sat_combined = th.cat([sat_h, sat_features], dim=-1)     # (B, M, D+d_sat)
+
+        queries = self.query_proj(task_combined)                  # (B, I, H)
+        keys = self.key_proj(sat_combined)                        # (B, M, H)
 
         base_scores = th.bmm(queries, keys.transpose(1, 2)) / np.sqrt(self.score_hidden)  # (B, I, M)
 
@@ -208,13 +255,14 @@ class PointerScorerV2_Attention(nn.Module):
                                 edge_rate.unsqueeze(-1)], dim=-1)  # (B, I, M, 2)
         edge_bias = self.edge_proj(edge_features).squeeze(-1)      # (B, I, M)
 
-        scores_sat = base_scores + edge_bias                       # (B, I, M_sat)
+        offload_scores = base_scores + edge_bias                   # (B, I, M_sat)
 
-        if extra > 0:
-            extra_scores = self.extra_bias[:extra].view(1, 1, extra).expand(B, I, extra)
-            scores = th.cat([scores_sat, extra_scores], dim=-1)    # (B, I, B_actions)
-        else:
-            scores = scores_sat
+        # ── 拼接: [local(1), offload(M_sat)] = B_actions 列 ──
+        scores = th.cat([local_score, offload_scores], dim=-1)     # (B, I, 1+M_sat)
+
+        assert scores.shape[-1] == self.B_actions, (
+            f"scores dim {scores.shape[-1]} != B_actions {self.B_actions}"
+        )
 
         return scores.reshape(B, I * self.B_actions)
 

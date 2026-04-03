@@ -1,5 +1,6 @@
 import warnings
 from collections.abc import Callable
+from numbers import Number
 from typing import Any
 
 import gymnasium as gym
@@ -9,6 +10,37 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv, VecMonitor, is
 
 from sb3_contrib.common.maskable.utils import get_action_masks, is_masking_supported
 from sb3_contrib.ppo_mask import MaskablePPO
+
+
+def _assert_all_finite(name: str, value: Any) -> None:
+    if isinstance(value, dict):
+        for key, sub_value in value.items():
+            _assert_all_finite(f"{name}.{key}", sub_value)
+        return
+    if isinstance(value, (list, tuple)):
+        for idx, sub_value in enumerate(value):
+            _assert_all_finite(f"{name}[{idx}]", sub_value)
+        return
+    if isinstance(value, np.ndarray):
+        if not np.isfinite(value).all():
+            raise AssertionError(
+                f"[FiniteAssert] {name} contains NaN/Inf, shape={value.shape}, dtype={value.dtype}"
+            )
+        return
+    if isinstance(value, (np.generic, Number)):
+        if not np.isfinite(value):
+            raise AssertionError(f"[FiniteAssert] {name} is not finite: {value}")
+
+
+def _assert_infos_finite(name: str, infos: list[dict[str, Any]]) -> None:
+    for i, info in enumerate(infos):
+        for key, val in info.items():
+            if isinstance(val, dict):
+                for sub_key, sub_val in val.items():
+                    if isinstance(sub_val, (np.ndarray, np.generic, Number)):
+                        _assert_all_finite(f"{name}[{i}].{key}.{sub_key}", sub_val)
+            elif isinstance(val, (np.ndarray, np.generic, Number)):
+                _assert_all_finite(f"{name}[{i}].{key}", val)
 
 
 def evaluate_policy(
@@ -88,11 +120,13 @@ def evaluate_policy(
     current_rewards = np.zeros(n_envs)
     current_lengths = np.zeros(n_envs, dtype="int")
     observations = env.reset()
+    _assert_all_finite("evaluate.observations.reset", observations)
     states = None
     episode_starts = np.ones((env.num_envs,), dtype=bool)
     while (episode_counts < episode_count_targets).any():
         if use_masking:
             action_masks = get_action_masks(env)
+            _assert_all_finite("evaluate.action_masks", action_masks)
             actions, state = model.predict(
                 observations,  # type: ignore[arg-type]
                 state=states,
@@ -107,7 +141,11 @@ def evaluate_policy(
                 episode_start=episode_starts,
                 deterministic=deterministic,
             )
+        _assert_all_finite("evaluate.actions", actions)
         observations, rewards, dones, infos = env.step(actions)
+        _assert_all_finite("evaluate.observations.step", observations)
+        _assert_all_finite("evaluate.rewards", rewards)
+        _assert_infos_finite("evaluate.infos", infos)
         current_rewards += rewards
         current_lengths += 1
         for i in range(n_envs):

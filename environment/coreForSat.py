@@ -174,14 +174,15 @@ class IoTDevice(UserCluster):
         确定生成的任务数量 X ~ Poisson(lambda0 * tau)
         """
         # 注意：lambda0 是单位时间(tau=1s)内的平均到达率
-        num_arrivals = np.random.poisson(self.lambda0 * tau)
+        # num_arrivals = np.random.poisson(self.lambda0 * tau)
+        num_arrivals = 1
         
         for _ in range(num_arrivals):
             # --- 参数分布设置 (建议根据具体论文场景调整) ---
             #创建任务参数
             
             # Z_i: 任务大小，均匀分布 [500, 1000] kbit
-            z_i = int(np.random.uniform(5, 10)) * 1e2  
+            z_i = int(np.random.uniform(7, 10)) * 1e2  #(5,10)
             
             # k_i: 计算密度，均匀分布 [] Gcycles/kbit
             # k_i = int(np.random.uniform(2, 10)) * 1e-4
@@ -404,6 +405,7 @@ class SatMECNode(SatelliteNode):
         """
         if self.comp_resource <= 0:
             return float('inf')
+        # print(f"卫星{self.id}的队列积压: {self.queue_backlog:.4f}")
         return self.queue_backlog / self.comp_resource
 
 

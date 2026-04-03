@@ -184,7 +184,7 @@ class SatelliteEvalCallback(MaskableEvalCallback):
                     print("New best mean reward!")
                 if self.best_model_save_path is not None:
                     self.model.save(
-                        os.path.join(self.best_model_save_path, "best_model_20usesr")
+                        os.path.join(self.best_model_save_path, "best_model")
                     )
                 self.best_mean_reward = float(mean_reward)
                 if self.callback_on_new_best is not None:
@@ -349,6 +349,7 @@ def train(
     save_dir: str = "./satellite_maskppo_models/",
     seed: int = 42,
     verbose: int = 1,
+    device: str | None = "auto",
 ):
     """
     完整训练流程（支持并行环境加速）：
@@ -426,6 +427,7 @@ def train(
         tensorboard_log=log_dir,
         verbose=verbose,
         seed=seed,
+        device=device,
     )
 
     print(f"  策略网络: {model.policy}")
@@ -529,32 +531,32 @@ if __name__ == "__main__":
     trained_model = train(
         # ── 环境 ──
         num_satellites=4,
-        num_users=10, #10,20
+        num_users=6, #10,20
         lambda0=0.3, # 0.3,0.25
         I_max=6, #6,
         max_steps=60,
         env_update_interval=5,
         # ── 并行 ──
-        n_envs=4,                # 4 个并行环境，数据收集加速约 4 倍
+        n_envs=8,                # 4 个并行环境，数据收集加速约 4 倍
         vec_env_cls="subproc",   # "subproc"=多进程真并行, "dummy"=单进程顺序
         # ── 训练 ──
-        total_timesteps=1000_000,
+        total_timesteps=1_000_000,
         n_steps=1024,             # 256,512 每个环境收集 256 步，总 buffer = 256×4 = 1024
-        batch_size=256,         #64, 128
+        batch_size=128,         #64, 128
         n_epochs=5,             # 对同一批 rollout 数据重复训练几轮 10
         learning_rate=3e-4,     #3e-4
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.02,
+        ent_coef=0.03,
         target_kl=0.03,
         # ── 评估 ──
-        eval_freq=10_000,         # 约每 5000 个 timestep 评估一次
-        n_eval_episodes=5,
+        eval_freq=20_000,         # 约每 5000 个 timestep 评估一次
+        n_eval_episodes=4,
         # ── 日志 ──
         log_dir="./satellite_maskppo_logs/",
         save_dir="./satellite_maskppo_models/",
         seed=42,
         verbose=1,
-
+        device="cuda:0",
     )

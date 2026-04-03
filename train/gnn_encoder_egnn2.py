@@ -53,15 +53,17 @@ class EGNNBlock(nn.Module):
         
         # ─── 1. Task -> Sat 网络 (边特征: task_sat_dist) ───
         self.msg_t2s = nn.Sequential(
-            nn.Linear(in_edge, hidden_dim, bias=False),
+            nn.Linear(in_edge, hidden_dim),
             nn.ELU(),
-            nn.Linear(hidden_dim, hidden_dim, bias=False)
+            nn.Linear(hidden_dim, hidden_dim),
         )
         self.norm_sat = nn.LayerNorm(hidden_dim)
 
         # ─── 2. Sat -> Task 网络 (边特征: task_sat_rate) ───
-        self.msg_s2t = nn.Linear(in_edge, hidden_dim, bias=False)
-        self.attn_s2t = nn.Linear(in_edge, num_heads, bias=False)
+        self.msg_s2t = nn.Linear(in_edge, hidden_dim)
+        self.attn_s2t = nn.Linear(in_edge, num_heads)
+        # 温度缩放：防止注意力过早 one-hot，保持梯度多路径传播
+        self.attn_temperature = nn.Parameter(torch.ones(1) * (hidden_dim // num_heads) ** 0.5)
         self.norm_task = nn.LayerNorm(hidden_dim)
         
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -110,13 +112,23 @@ class EGNNBlock(nn.Module):
         inp_s2t = torch.cat([si, tj, edge_rate_s2t], dim=-1)  # (B, M, I, 2D + edge_dim)
         
         msg_s2t_out = self.msg_s2t(inp_s2t).view(B, M, I, self.num_heads, self.d_k)
-        logits = self.attn_s2t(inp_s2t)                       # (B, M, I, H)
+        # Pointer Network 风格的 logit 截断：C·tanh(raw/C)
+        #   - 近似线性区（|raw| << C）保持梯度不失真
+        #   - 饱和区（|raw| >> C）硬性钳制到 ±C，防止 softmax one-hot 化
+        # 与温度缩放等价：统一由 attn_temperature（初始值 = sqrt(d_k)）控制尺度
+        C = self.attn_temperature.clamp(min=0.1)                               # scalar
+        raw_logits = self.attn_s2t(inp_s2t)                                    # (B, M, I, H)
+        logits = C * torch.tanh(raw_logits / C)                                # (B, M, I, H)
         
         mask_s2t = adj_s2t.unsqueeze(-1)                       # (B, M, I, 1)
-        logits = logits.masked_fill(mask_s2t == 0, float("-inf"))
-        
-        alpha = torch.softmax(logits, dim=1)
-        alpha = torch.nan_to_num(alpha, nan=0.0)
+        # 用大负数替代 -inf，避免 softmax 输出 NaN 导致梯度截断
+        logits = logits.masked_fill(mask_s2t == 0, -1e9)
+
+        alpha = torch.softmax(logits, dim=1)                   # (B, M, I, H)
+        # 将 padding 位置的注意力权重归零（保持梯度连续性）
+        alpha = alpha * mask_s2t
+        # 对有效行归一化，防止权重之和为 0 造成数值不稳定
+        alpha = alpha / (alpha.sum(dim=1, keepdim=True).clamp(min=1e-6))
         alpha = self.dropout(alpha)
         
         agg_task = (alpha.unsqueeze(-1) * msg_s2t_out).sum(dim=1).reshape(B, I, D)
@@ -203,7 +215,7 @@ class GNNFeaturesExtractor(BaseFeaturesExtractor):
             nn.Linear(fusion_in, hidden_f),
             nn.ELU(),
             nn.Linear(hidden_f, features_dim),
-            nn.ELU(),
+            # 不在输出层添加激活：保持特征值无界，避免 ELU 负饱和区截断梯度
         )
 
         # ─── 正交初始化 ───

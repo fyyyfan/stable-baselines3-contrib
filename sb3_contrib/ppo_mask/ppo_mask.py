@@ -1,4 +1,5 @@
 import os
+import inspect
 from numbers import Number
 from typing import Any, ClassVar, TypeVar
 
@@ -123,6 +124,8 @@ class MaskablePPO(OnPolicyAlgorithm):
         policy: str | type[MaskableActorCriticPolicy],
         env: GymEnv | str,
         learning_rate: float | Schedule = 3e-4,
+        actor_learning_rate: float | Schedule | None = None,
+        critic_learning_rate: float | Schedule | None = None,
         n_steps: int = 2048,
         batch_size: int | None = 64,
         n_epochs: int = 10,
@@ -179,6 +182,10 @@ class MaskablePPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
+        self.actor_learning_rate = learning_rate if actor_learning_rate is None else actor_learning_rate
+        self.critic_learning_rate = learning_rate if critic_learning_rate is None else critic_learning_rate
+        self.actor_lr_schedule = FloatSchedule(self.actor_learning_rate)
+        self.critic_lr_schedule = FloatSchedule(self.critic_learning_rate)
 
         if _init_setup_model:
             self._setup_model()
@@ -187,11 +194,18 @@ class MaskablePPO(OnPolicyAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
+        policy_kwargs = dict(self.policy_kwargs)
+        policy_signature = inspect.signature(self.policy_class.__init__)
+        if "actor_lr_schedule" in policy_signature.parameters:
+            policy_kwargs.setdefault("actor_lr_schedule", self.actor_lr_schedule)
+        if "critic_lr_schedule" in policy_signature.parameters:
+            policy_kwargs.setdefault("critic_lr_schedule", self.critic_lr_schedule)
+
         self.policy = self.policy_class(  # type: ignore[assignment]
             self.observation_space,
             self.action_space,
             self.lr_schedule,
-            **self.policy_kwargs,
+            **policy_kwargs,
         )
         self.policy = self.policy.to(self.device)
 
@@ -382,8 +396,19 @@ class MaskablePPO(OnPolicyAlgorithm):
         """
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
-        # Update optimizer learning rate
-        self._update_learning_rate(self.policy.optimizer)
+        use_dual_optim = hasattr(self.policy, "actor_optimizer") and hasattr(self.policy, "critic_optimizer")
+        if use_dual_optim:
+            actor_lr_now = self.actor_lr_schedule(self._current_progress_remaining)
+            critic_lr_now = self.critic_lr_schedule(self._current_progress_remaining)
+            for param_group in self.policy.actor_optimizer.param_groups:  # type: ignore[attr-defined]
+                param_group["lr"] = actor_lr_now
+            for param_group in self.policy.critic_optimizer.param_groups:  # type: ignore[attr-defined]
+                param_group["lr"] = critic_lr_now
+            self.logger.record("train/actor_learning_rate", actor_lr_now)
+            self.logger.record("train/critic_learning_rate", critic_lr_now)
+        else:
+            # Update optimizer learning rate (兼容单优化器 policy)
+            self._update_learning_rate(self.policy.optimizer)
         # Compute current clip range
         clip_range = self.clip_range(self._current_progress_remaining)  # type: ignore[operator]
         # Optional: clip range for the value function
@@ -393,6 +418,9 @@ class MaskablePPO(OnPolicyAlgorithm):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
+        # ── 新增监控列表 ──
+        adv_means, adv_stds = [], []
+        actor_grad_norms = []
 
         continue_training = True
 
@@ -415,6 +443,9 @@ class MaskablePPO(OnPolicyAlgorithm):
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
+                # ── [监控] 归一化前的 advantages 统计 ──
+                adv_means.append(advantages.mean().item())
+                adv_stds.append(advantages.std().item())
                 if self.normalize_advantage:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -471,11 +502,32 @@ class MaskablePPO(OnPolicyAlgorithm):
                     break
 
                 # Optimization step
-                self.policy.optimizer.zero_grad()
+                if use_dual_optim:
+                    self.policy.actor_optimizer.zero_grad()  # type: ignore[attr-defined]
+                    self.policy.critic_optimizer.zero_grad()  # type: ignore[attr-defined]
+                else:
+                    self.policy.optimizer.zero_grad()
                 loss.backward()
+                # ── [监控] Actor 梯度范数（pointer_scorer 优先，否则退回全局）──
+                if hasattr(self.policy, "pointer_scorer"):
+                    actor_params = list(self.policy.pointer_scorer.parameters())
+                else:
+                    actor_params = list(self.policy.parameters())
+                actor_grad_norm = th.sqrt(
+                    sum(
+                        p.grad.detach().pow(2).sum()
+                        for p in actor_params
+                        if p.grad is not None
+                    )
+                ).item()
+                actor_grad_norms.append(actor_grad_norm)
                 # Clip grad norm
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                self.policy.optimizer.step()
+                if use_dual_optim:
+                    self.policy.actor_optimizer.step()  # type: ignore[attr-defined]
+                    self.policy.critic_optimizer.step()  # type: ignore[attr-defined]
+                else:
+                    self.policy.optimizer.step()
 
             if not continue_training:
                 break
@@ -495,6 +547,16 @@ class MaskablePPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+        # ── [监控] advantages 统计 & Actor 梯度范数 ──
+        self.logger.record("train/advantages_mean", np.mean(adv_means))
+        self.logger.record("train/advantages_std", np.mean(adv_stds))
+        if actor_grad_norms:
+            self.logger.record("train/actor_grad_norm", np.mean(actor_grad_norms))
+            # print(
+            #     f"[train #{self._n_updates}] "
+            #     f"adv_mean={np.mean(adv_means):.4f} adv_std={np.mean(adv_stds):.4f} | "
+            #     f"actor_grad_norm={np.mean(actor_grad_norms):.6f}"
+            # )
 
     def learn(  # type: ignore[override]
         self: SelfMaskablePPO,
